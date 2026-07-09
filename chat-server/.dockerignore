@@ -1,0 +1,14 @@
+# Exclude dev/test artefacts from the chat-server image so the build
+# context stays small. `lib/` and `server.js` are deliberately copied
+# (those are the runtime artefacts).
+
+test/
+*.test.js
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+node_modules/
+*.log
+README.md
+.DS_Store

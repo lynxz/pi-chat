@@ -1,0 +1,23 @@
+{
+  "name": "pi-chat-extension",
+  "version": "0.2.0",
+  "description": "Pi extension that lets several Pi harnesses talk to each other through a chat server. Companion to chat-server.",
+  "private": true,
+  "type": "module",
+  "main": "index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-transform-types --test test/*.test.ts",
+    "canary": "node --experimental-transform-types scripts/canary.ts"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "^1.1.0"
+  }
+}

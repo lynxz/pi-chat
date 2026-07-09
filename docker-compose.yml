@@ -1,0 +1,270 @@
+# docker-compose.yml — single-room + multi-room examples.
+#
+# Topology at a glance:
+#
+#   chat                    ← chat-server (single instance, holds room state)
+#   │
+#   ├── pi-alice            ← single-room baseline (backend only)
+#   ├── pi-bob              ← single-room baseline (backend only) — alice's peer
+#   ├── pi-multi-alice      ← multi-room: backend (questions) + incidents (all)
+#   ├── pi-multi-bob        ← multi-room: backend (questions) + incidents (all)
+#   └── pi-oncall           ← single-room: incidents only (all-mode, on-call responder)
+#
+# Quick start (single-room baseline):
+#   docker compose up -d chat pi-alice pi-bob pi-oncall
+#   docker compose exec pi-alice pi
+#   docker compose exec pi-bob   pi
+#
+#   Then `/chat-send hello @bob` in alice's session shows up as a notification
+#   in bob's session (and vice versa). On-call gets paged on any incident.
+#
+# Quick start (multi-room):
+#   docker compose up -d chat pi-multi-alice pi-multi-bob
+#   docker compose exec pi-multi-alice pi
+#   docker compose exec pi-multi-bob   pi
+#
+#   Both agents are in #backend-team (questions mode — @-mention to reply)
+#   AND #incidents (all mode — wake on anything). Status footer should read
+#   `chat: backend=…, incidents=… (focus=backend) you=alice-multi`.
+#
+# Compose patterns in use (see extensions/pi-chat/README.md "Compose
+# patterns" for full details):
+#
+#   - Single-room container (pi-alice, pi-bob, pi-oncall): flat PI_CHAT_*
+#     vars only. The runtime synthesises a single room (alias `DEFAULT`).
+#   - Multi-room container (pi-multi-alice, pi-multi-bob): per-container
+#     invariants go on flat PI_CHAT_* (SERVER, AGENT, HISTORy, …); per-room
+#     variations sit under PI_CHAT_ROOM_<ALIAS>__<FIELD> (only _ROOM +
+#     _AUTOREPLY_MODE in this example). Per-alias keys fall back to flat,
+#     so omitted per-room fields inherit the container-wide default.
+#
+# The `pi-*` images are placeholders — replace with whatever Pi image you
+# actually run. The compose shape (env-var wiring + healthcheck-gated
+# depends_on) is what matters.
+
+services:
+  chat:
+    build:
+      context: ./chat-server
+      dockerfile: Dockerfile
+    image: pi-chat-server:dev
+    container_name: pi-chat-server
+    restart: unless-stopped
+    environment:
+      CHAT_PORT: "8080"
+      CHAT_HISTORY_LIMIT: "500"
+      # The following env knobs are read by chat-server's `lib/config.js`
+      # `loadConfig()`. All have sensible production defaults — uncomment
+      # to override. See chat-server/README.md "Configuration" for the
+      # full table and the recommended ratios between
+      # `CHAT_PING_INTERVAL_MS`, `CHAT_SWEEPER_INTERVAL_MS`, and `CHAT_STALE_MS`.
+      # CHAT_HOST: "0.0.0.0"
+      # CHAT_RATE_LIMIT_PER_SEC: "10"
+      # CHAT_RATE_LIMIT_WINDOW_MS: "1000"
+      # CHAT_MAX_BODY_BYTES: "6144"
+      # CHAT_STALE_MS: "60000"
+      # CHAT_SWEEPER_INTERVAL_MS: "5000"
+      # CHAT_PING_INTERVAL_MS: "20000"
+      # Logging knobs — chat-server's localLog writes one line per request.
+      # QUIET=1 silences request logging (useful for noisy local dev).
+      # QUIET: "1"
+    ports:
+      # Uncomment to expose the chat-server on the host (e.g. for an IDE
+      # extension or a Pi container running on the host to reach it).
+      # Otherwise it's only reachable inside the compose network as `chat:8080`.
+      - "8080:8080"
+    healthcheck:
+      # Mirrors the Dockerfile's HEALTHCHECK — uses Node's built-in fetch.
+      test:
+        - "CMD"
+        - "node"
+        - "-e"
+        - "fetch('http://127.0.0.1:'+(process.env.CHAT_PORT||8080)+'/health').then(r=>{process.exit(r.status===200?0:1)}).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Single-room baseline. Two peers in #backend-team only.
+  # ────────────────────────────────────────────────────────────────────────
+
+  pi-alice:
+    # Replace with your Pi image. Examples:
+    #   image: my-pi-image:latest
+    #   build: ./path/to/pi-image
+    image: pi:dev
+    container_name: pi-alice
+    restart: unless-stopped
+    environment:
+      # Flat PI_CHAT_* vars are equivalent to a single room with alias `DEFAULT`.
+      PI_CHAT_SERVER: "http://chat:8080"
+      PI_CHAT_ROOM: "backend-team"
+      PI_CHAT_AGENT: "alice"
+      # Both peers auto-respond symmetrically (mode: questions). alice and
+      # bob can each ping the other freely; each wakes on any trailing `?`
+      # and continues multi-turn threads via replyTo chains.
+      PI_CHAT_AUTOREPLY: "true"
+      PI_CHAT_AUTOREPLY_MODE: "questions"
+      PI_CHAT_HISTORY: "20"
+      PI_CHAT_RECONNECT_MS: "2000"
+      PI_CHAT_COOLDOWN_MS: "2000"
+      # Lower the wall-clock floor between auto-reply turns so the
+      # conversation feels like dialogue, not 1-per-5s ping-pong.
+      PI_CHAT_MIN_GAP_MS: "1000"
+      PI_CHAT_REPLY_CHAIN_MS: "60000"
+      PI_CHAT_RECENT_BUFFER: "20"
+      PI_CHAT_THREAD_CONTEXT: "true"
+      # Pi needs an LLM API key. Compose reads it from the host env so
+      # the secret never lands in the committed file.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    depends_on:
+      chat:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+  pi-bob:
+    image: pi:dev
+    container_name: pi-bob
+    restart: unless-stopped
+    environment:
+      PI_CHAT_SERVER: "http://chat:8080"
+      PI_CHAT_ROOM: "backend-team"
+      PI_CHAT_AGENT: "bob"
+      PI_CHAT_AUTOREPLY: "true"
+      PI_CHAT_AUTOREPLY_MODE: "questions"   # symmetric with alice
+      PI_CHAT_HISTORY: "20"
+      PI_CHAT_RECONNECT_MS: "2000"
+      PI_CHAT_COOLDOWN_MS: "2000"
+      PI_CHAT_MIN_GAP_MS: "1000"
+      PI_CHAT_REPLY_CHAIN_MS: "60000"
+      PI_CHAT_RECENT_BUFFER: "20"
+      PI_CHAT_THREAD_CONTEXT: "true"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    depends_on:
+      chat:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Multi-room examples.
+  #
+  # Two agents (`pi-multi-alice` and `pi-multi-bob`) each subscribe to
+  # BOTH rooms with deliberately different per-room auto-reply config:
+  #
+  #   Room #backend-team  →  mode=questions  (wake on @-mention or trailing ?)
+  #   Room #incidents     →  mode=all        (wake on EVERY inbound — paging)
+  #
+  # Each agent uses the SAME display name (`alice-multi` / `bob-multi`) in
+  # both rooms. The server keys uniqueness on `(room, agent)` so the same
+  # name across rooms is fine; internally the runtime routes per alias.
+  # ────────────────────────────────────────────────────────────────────────
+
+  pi-multi-alice:
+    image: pi:dev
+    container_name: pi-multi-alice
+    restart: unless-stopped
+    environment:
+      # Per-container invariants — shared by every room on this container.
+      # (Env-reader falls back: per-room key > flat PI_CHAT_<FIELD> > default.)
+      PI_CHAT_SERVER: "http://chat:8080"
+      PI_CHAT_AGENT: "alice-multi"
+      PI_CHAT_AUTOREPLY: "true"
+      PI_CHAT_HISTORY: "20"
+      PI_CHAT_RECONNECT_MS: "2000"
+      PI_CHAT_COOLDOWN_MS: "2000"
+      PI_CHAT_MIN_GAP_MS: "1000"
+      PI_CHAT_REPLY_CHAIN_MS: "60000"
+      PI_CHAT_RECENT_BUFFER: "20"
+      PI_CHAT_THREAD_CONTEXT: "true"
+      # Per-room — only fields that actually vary between rooms on this
+      # container. Backend uses questions-mode (work coordination);
+      # incidents uses all-mode (pager).
+      PI_CHAT_ROOM_BACKEND__ROOM: "backend-team"
+      PI_CHAT_ROOM_BACKEND__AUTOREPLY_MODE: "questions"
+      PI_CHAT_ROOM_INCIDENTS__ROOM: "incidents"
+      PI_CHAT_ROOM_INCIDENTS__AUTOREPLY_MODE: "all"
+      # Per-room override: incidents paged messages stack fast, so use a
+      # tighter per-sender cooldown on that room only.
+      PI_CHAT_ROOM_INCIDENTS__COOLDOWN_MS: "200"
+      # Per-container secret.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    depends_on:
+      chat:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+  pi-multi-bob:
+    image: pi:dev
+    container_name: pi-multi-bob
+    restart: unless-stopped
+    environment:
+      # Per-container invariants — shared by every room on this container.
+      PI_CHAT_SERVER: "http://chat:8080"
+      PI_CHAT_AGENT: "bob-multi"
+      PI_CHAT_AUTOREPLY: "true"
+      PI_CHAT_HISTORY: "20"
+      PI_CHAT_RECONNECT_MS: "2000"
+      PI_CHAT_COOLDOWN_MS: "2000"
+      PI_CHAT_MIN_GAP_MS: "1000"
+      PI_CHAT_REPLY_CHAIN_MS: "60000"
+      PI_CHAT_RECENT_BUFFER: "20"
+      PI_CHAT_THREAD_CONTEXT: "true"
+      # Per-room — only fields that actually vary between rooms.
+      PI_CHAT_ROOM_BACKEND__ROOM: "backend-team"
+      PI_CHAT_ROOM_BACKEND__AUTOREPLY_MODE: "questions"
+      PI_CHAT_ROOM_INCIDENTS__ROOM: "incidents"
+      PI_CHAT_ROOM_INCIDENTS__AUTOREPLY_MODE: "all"
+      # Per-room override — same pager tightening as alice-multi.
+      PI_CHAT_ROOM_INCIDENTS__COOLDOWN_MS: "200"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    depends_on:
+      chat:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+  # ────────────────────────────────────────────────────────────────────────
+  # On-call responder — single-room, #incidents only, in `all` mode so it
+  # wakes on every paged message. Demonstrates that an agent can be in a
+  # single room while others are multi-room, all on the same chat-server.
+  # ────────────────────────────────────────────────────────────────────────
+
+  pi-oncall:
+    image: pi:dev
+    container_name: pi-oncall
+    restart: unless-stopped
+    environment:
+      # Single-room container — flat vars only, no prefixed keys needed.
+      # The runtime synthesises a single room with alias `DEFAULT`.
+      PI_CHAT_SERVER: "http://chat:8080"
+      PI_CHAT_ROOM: "incidents"
+      PI_CHAT_AGENT: "alice-oncall"
+      # All-mode so we wake on EVERY paged message — that's the on-call job.
+      PI_CHAT_AUTOREPLY: "true"
+      PI_CHAT_AUTOREPLY_MODE: "all"
+      # Lower cooldown so rapid-fire pings don't get suppressed.
+      PI_CHAT_COOLDOWN_MS: "200"
+      # Larger recent-buffer so we see context for ongoing incidents.
+      PI_CHAT_RECENT_BUFFER: "50"
+      PI_CHAT_HISTORY: "50"
+      PI_CHAT_RECONNECT_MS: "2000"
+      PI_CHAT_MIN_GAP_MS: "500"
+      PI_CHAT_REPLY_CHAIN_MS: "120000"
+      PI_CHAT_THREAD_CONTEXT: "true"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    depends_on:
+      chat:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+# Networks — the default `bridge` is fine for this example. Both Pi
+# services reach `chat` by service name. Outbound from chat to anywhere
+# is not needed (chat-server is fully outbound-less).
+networks:
+  default:
+    name: pi-chat

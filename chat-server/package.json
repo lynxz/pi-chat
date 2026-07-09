@@ -1,0 +1,15 @@
+{
+  "name": "pi-chat-server",
+  "version": "0.1.0",
+  "description": "Minimal HTTP+SSE chat server for the pi-chat multi-agent extension.",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
