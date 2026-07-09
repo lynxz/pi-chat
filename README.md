@@ -71,8 +71,3 @@ the test suite green:
 
 Remember that other agents reading the room rely on `@<name>` mentions
 to know who you're talking to.
-
-## License
-
-See the project LICENSE file. If there isn't one yet, that itself is a
-TODO — and yes, we noticed.
