@@ -373,3 +373,201 @@ describe("chat-server (HTTP integration)", () => {
     sse.req.destroy();
   });
 });
+
+// ===== Auth gating =======================================================
+// Tests that exercise `checkRoomAccess` via the dispatcher. A separate
+// server instance is spun up with `CHAT_ROOM_TOKENS` so the rest of the
+// suite (no-room-tokens) is unaffected.
+
+describe("chat-server (auth gating)", () => {
+  /** @type {Awaited<ReturnType<typeof setupTestServer>>} */
+  let authSetup;
+  let authBase;
+
+  before(async () => {
+    authSetup = await setupTestServer({
+      env: { CHAT_ROOM_TOKENS: '{"secure":"s3cret"}' },
+    });
+    authBase = authSetup.baseUrl;
+  });
+  after(async () => {
+    await authSetup.shutdown();
+  });
+
+  /** Like `openSse` but against `authBase` with optional headers and query token. */
+  function openSseAuth({ room, agent, headers = {}, token }) {
+    const qs = token ? `&token=${encodeURIComponent(token)}` : "";
+    const url = `${authBase}/rooms/${room}/events?agent=${encodeURIComponent(agent)}${qs}`;
+    return new Promise((resolve, reject) => {
+      const req = http.request(
+        url,
+        { method: "GET", headers: { Accept: "text/event-stream", ...headers } },
+        (res) => {
+          if (res.statusCode !== 200) {
+            let body = "";
+            res.on("data", (c) => (body += c.toString("utf8")));
+            res.on("end", () =>
+              reject(Object.assign(new Error("sse_not_200"), { status: res.statusCode, body })),
+            );
+            return;
+          }
+
+          const frames = [];
+          let buf = "";
+          let resolved = false;
+
+          const parse = () => {
+            let idx;
+            while ((idx = buf.indexOf("\n\n")) !== -1) {
+              const frame = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
+              let event = "message";
+              let data = "";
+              for (const line of frame.split("\n")) {
+                if (line.startsWith("event: ")) event = line.slice(7).trim();
+                else if (line.startsWith("data: ")) data += (data ? "\n" : "") + line.slice(6);
+              }
+              const parsed = { event, data: data ? JSON.parse(data) : null };
+              frames.push(parsed);
+              if (!resolved && event === "hello") {
+                resolved = true;
+                resolve({ req, res, frames });
+              }
+            }
+          };
+
+          res.on("data", (c) => { buf += c.toString("utf8"); parse(); });
+          res.on("error", (e) => { if (!resolved) reject(e); });
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+  }
+
+  /** Like `postMessage` but against `authBase` with optional headers and query token. */
+  async function postMessageAuth(room, body, { headers = {}, token } = {}) {
+    const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+    const res = await fetch(`${authBase}/rooms/${room}/messages${qs}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = null; }
+    return { status: res.status, json };
+  }
+
+  // -- always-open endpoints -----------------------------------------------
+
+  it("GET /health returns 200", async () => {
+    const res = await fetch(`${authBase}/health`);
+    assert.equal(res.status, 200);
+  });
+
+  it("GET / returns 200", async () => {
+    const res = await fetch(`${authBase}/`);
+    assert.equal(res.status, 200);
+  });
+
+  it("protected room: GET /history without token → 200", async () => {
+    const res = await fetch(`${authBase}/rooms/secure/history`);
+    assert.equal(res.status, 200);
+  });
+
+  it("protected room: GET /agents without token → 200", async () => {
+    const res = await fetch(`${authBase}/rooms/secure/agents`);
+    assert.equal(res.status, 200);
+  });
+
+  it("protected room: POST /heartbeat without token → 204", async () => {
+    // Heartbeat endpoint is open (no requireAuth), but still needs a connected agent.
+    const conn = await openSseAuth({ room: "secure", agent: "alice", token: "s3cret" });
+    try {
+      const res = await fetch(`${authBase}/rooms/secure/agents/alice/heartbeat`, { method: "POST" });
+      assert.equal(res.status, 204);
+    } finally {
+      conn.req.destroy();
+    }
+  });
+
+  // -- POST /messages auth -------------------------------------------------
+
+  it("open room: POST /messages → 201 (no token needed)", async () => {
+    // Open room — connect an agent first.
+    const conn = await openSseAuth({ room: "lobby", agent: "alice" });
+    try {
+      const r = await postMessageAuth("lobby", { from: "alice", text: "hi" });
+      assert.equal(r.status, 201);
+    } finally {
+      conn.req.destroy();
+    }
+  });
+
+  it("protected room: POST /messages without token → 401", async () => {
+    const r = await postMessageAuth("secure", { from: "alice", text: "hi" });
+    assert.equal(r.status, 401);
+    assert.equal(r.json.error, "token_required");
+  });
+
+  it("protected room: POST /messages with wrong Bearer token → 403", async () => {
+    const r = await postMessageAuth("secure", { from: "alice", text: "hi" }, {
+      headers: { Authorization: "Bearer wrong" },
+    });
+    assert.equal(r.status, 403);
+    assert.equal(r.json.error, "invalid_token");
+  });
+
+  it("protected room: POST /messages with correct Bearer token → 201 and fan-out", async () => {
+    const alice = await openSseAuth({ room: "secure", agent: "alice", token: "s3cret" });
+    const bob = await openSseAuth({ room: "secure", agent: "bob", token: "s3cret" });
+    await new Promise((r) => setTimeout(r, 50));
+    try {
+      const r = await postMessageAuth("secure", { from: "alice", text: "hey @bob" }, {
+        headers: { Authorization: "Bearer s3cret" },
+      });
+      assert.equal(r.status, 201);
+
+      await new Promise((r) => setTimeout(r, 50));
+      const msg = bob.frames.find((f) => f.event === "message" && f.data.from === "alice");
+      assert.ok(msg, "bob should have received the message");
+      assert.equal(msg.data.text, "hey @bob");
+    } finally {
+      alice.req.destroy();
+      bob.req.destroy();
+    }
+  });
+
+  // -- GET /events auth ----------------------------------------------------
+
+  it("protected room: GET /events without token → 401", async () => {
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request(
+        `${authBase}/rooms/secure/events?agent=alice`,
+        { method: "GET" },
+        (res) => {
+          let body = "";
+          res.on("data", (c) => (body += c.toString("utf8")));
+          res.on("end", () => resolve({ status: res.statusCode, body }));
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+    assert.equal(status.status, 401);
+    assert.match(status.body, /token_required/);
+  });
+
+  it("protected room: GET /events with correct token via query param → SSE opens, hello received", async () => {
+    const conn = await openSseAuth({ room: "secure", agent: "alice", token: "s3cret" });
+    try {
+      const hello = conn.frames.find((f) => f.event === "hello");
+      assert.ok(hello);
+      assert.equal(hello.data.agent, "alice");
+      assert.equal(hello.data.room, "secure");
+    } finally {
+      conn.req.destroy();
+    }
+  });
+});

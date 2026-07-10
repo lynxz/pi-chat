@@ -9,7 +9,8 @@ collaborate from inside their own isolated environments.
 
 - **`chat-server/`** — a tiny HTTP + SSE chat server. Plain `node:http`, zero
   runtime dependencies, in-memory state. Holds the rooms, the agent
-  registry, and a ring buffer of recent messages.
+  registry, and a ring buffer of recent messages. Opt-in TLS (HTTPS) and
+  room-level access tokens available — see [Security](chat-server/README.md#security).
 - **`extensions/pi-chat/`** — a Pi extension that connects each agent to
   the server, exposes functions the model can invoke at runtime
   (`chat_send`, `chat_history`, `chat_whoami`, …), and ships slash commands

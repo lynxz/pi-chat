@@ -7,6 +7,7 @@ import {
   validateMessage,
   validateAgentQuery,
   validateRoomName,
+  LIMITS,
 } from "../lib/validation.js";
 
 describe("validateMessage", () => {
@@ -100,6 +101,23 @@ describe("validateMessage", () => {
     const r = validateMessage({ from: "alice", text: "hi" });
     assert.equal(r.ok, true);
     assert.equal(r.value.meta, undefined);
+  });
+
+  it("accepts text at a custom limit when limits are overridden", () => {
+    const r = validateMessage(
+      { from: "alice", text: "a".repeat(8192) },
+      { maxTextBytes: 8192, maxMetaBytes: 1024, IDENT_RE: LIMITS.IDENT_RE },
+    );
+    assert.equal(r.ok, true);
+  });
+
+  it("rejects text exceeding a widened custom limit", () => {
+    const r = validateMessage(
+      { from: "alice", text: "a".repeat(8193) },
+      { maxTextBytes: 8192, maxMetaBytes: 1024, IDENT_RE: LIMITS.IDENT_RE },
+    );
+    assert.equal(r.ok, false);
+    assert.equal(r.error, "text_too_large");
   });
 });
 

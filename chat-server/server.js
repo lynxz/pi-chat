@@ -12,6 +12,8 @@
 //   hello, presence (joined/left), message, ping, goodbye (on shutdown)
 
 import { createServer } from "node:http";
+import { createServer as createSecureServer } from "node:https";
+import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 import { ServerState } from "./lib/state.js";
@@ -19,9 +21,11 @@ import {
   validateMessage,
   validateAgentQuery,
   validateRoomName,
+  LIMITS,
 } from "./lib/validation.js";
 import { SseConnection } from "./lib/sse.js";
 import { startStaleSweeper, stopStaleSweeper } from "./lib/sweeper.js";
+import { checkRoomAccess } from "./lib/auth.js";
 import { startPingScheduler, stopPingScheduler } from "./lib/ping-scheduler.js";
 import { loadConfig } from "./lib/config.js";
 
@@ -140,7 +144,7 @@ async function handlePostMessage(req, res, ctx, _url, room) {
     return jsonError(res, e.status ?? 400, e.message || "invalid_json");
   }
 
-  const v = validateMessage(body);
+  const v = validateMessage(body, ctx.limits);
   if (!v.ok) return jsonError(res, v.status, v.error);
 
   let result;
@@ -278,8 +282,8 @@ function handleGetEvents(_req, res, ctx, url, room) {
 const ROUTES = [
   { method: "GET",  re: HEALTH_PATH_RE,    handler: handleHealth },
   { method: "GET",  re: INDEX_PATH_RE,     handler: handleIndex },
-  { method: "POST", re: MSG_PATH_RE,       validateRoom: true, handler: handlePostMessage },
-  { method: "GET",  re: EVENTS_PATH_RE,    validateRoom: true, handler: handleGetEvents },
+  { method: "POST", re: MSG_PATH_RE,       validateRoom: true, requireAuth: true, handler: handlePostMessage },
+  { method: "GET",  re: EVENTS_PATH_RE,    validateRoom: true, requireAuth: true, handler: handleGetEvents },
   { method: "GET",  re: HISTORY_PATH_RE,   validateRoom: true, handler: handleGetHistory },
   { method: "GET",  re: AGENTS_PATH_RE,    validateRoom: true, handler: handleGetAgents },
   {
@@ -305,6 +309,10 @@ function dispatch(req, res, ctx, url, method, path) {
       const v = validateAgentQuery(m[2]);
       if (!v.ok) return jsonError(res, v.status, v.error);
     }
+    if (route.requireAuth) {
+      const auth = checkRoomAccess(ctx.config, m[1], req);
+      if (!auth.ok) return jsonError(res, auth.status, auth.error);
+    }
     // Hand off with uniform signature: (req, res, ctx, url, ...captures).
     return route.handler(req, res, ctx, url, ...m.slice(1));
   }
@@ -329,6 +337,8 @@ function dispatch(req, res, ctx, url, method, path) {
  *   env?: Record<string, string|undefined>,  // override env for testing
  *   port?: number,
  *   host?: string,
+ *   maxTextBytes?: number,
+ *   maxMetaBytes?: number,
  *   bodyLimit?: number,
  *   historyLimit?: number,
  *   rateLimitPerSec?: number,
@@ -351,6 +361,8 @@ export function createChatServer(opts = {}) {
 
   const port = opts.port ?? config.port;
   const host = opts.host ?? config.host;
+  const maxTextBytes = opts.maxTextBytes ?? config.maxTextBytes;
+  const maxMetaBytes = opts.maxMetaBytes ?? config.maxMetaBytes;
   const bodyLimit = opts.bodyLimit ?? config.bodyLimit;
   const historyLimit = opts.historyLimit ?? config.historyLimit;
   const rateLimitPerSec = opts.rateLimitPerSec ?? config.rateLimitPerSec;
@@ -359,20 +371,28 @@ export function createChatServer(opts = {}) {
   const sweeperIntervalMs = opts.sweeperIntervalMs ?? config.sweeperIntervalMs;
   const pingIntervalMs = opts.pingIntervalMs ?? config.pingIntervalMs;
 
+  const limits = {
+    maxTextBytes,
+    maxMetaBytes,
+    IDENT_RE: LIMITS.IDENT_RE,
+  };
+
   const ctx = {
     state: new ServerState({
       historyLimit,
       rateLimitPerSec,
       rateLimitWindowMs,
     }),
+    limits,
     bodyLimit,
+    config,
     _log: opts.quiet ? () => {} : log,
   };
   // Note: pingIntervalMs must be < staleMs / 2 for the ping to keep
   // idle connections ahead of the sweeper. Defaults satisfy this
   // (20000ms ping, 60000ms stale).
 
-  const server = createServer((req, res) => {
+  const handler = (req, res) => {
     Promise.resolve(route(req, res, ctx)).catch((err) => {
       ctx._log("unhandled", err?.stack ?? err);
       if (!res.headersSent) {
@@ -385,7 +405,25 @@ export function createChatServer(opts = {}) {
         try { res.destroy(); } catch { /* same */ }
       }
     });
-  });
+  };
+
+  /** @type {import("node:http").Server | import("node:https").Server} */
+  let server;
+  if (config.tlsCert && config.tlsKey) {
+    try {
+      const cert = readFileSync(config.tlsCert, "utf8");
+      const key = readFileSync(config.tlsKey, "utf8");
+      server = createSecureServer({ cert, key }, handler);
+    } catch (e) {
+      throw new Error(
+        `TLS configured but cert/key file(s) unreadable — ` +
+        `cert=${config.tlsCert} key=${config.tlsKey}: ${e.message}`,
+        { cause: e },
+      );
+    }
+  } else {
+    server = createServer(handler);
+  }
 
   let shuttingDown = false;
   // Stale-SSE sweeper: closes silent connections after `staleMs` (default 60s)
@@ -464,7 +502,7 @@ export function createChatServer(opts = {}) {
   async function start() {
     return new Promise((resolve) => {
       server.listen(port, host, () => {
-        ctx._log("listening", { host, port, historyLimit });
+        ctx._log("listening", { host, port, historyLimit, tls: !!(config.tlsCert && config.tlsKey) });
         resolve(server.address());
       });
     });

@@ -129,6 +129,7 @@ function makeHandle(config: ChatRoomConfig, opts: ChatRuntimeOptions): ChatRoomH
       room: env.room,
       agent: env.agent,
       reconnectMs: env.reconnectMs,
+      token: env.token,
       ...(opts.fetch ? { fetch: opts.fetch } : {}),
     }),
     autoreply: { value: env.autoreply, mode: env.autoreplyMode },

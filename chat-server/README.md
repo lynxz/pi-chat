@@ -88,15 +88,17 @@ All non-2xx responses are JSON: `{ "error": "<reason>" }`.
 | `404`  | `not_found`, `agent_not_connected` (heartbeat for un-bound agent) |
 | `409`  | `agent_in_use` (second SSE bind on the same name in the same room) |
 | `429`  | `rate_limit` (default 10 msg/s/agent; 11th within the window) |
+| `401`  | `token_required` (auth-protected room, no token provided) |
+| `403`  | `invalid_token` (auth-protected room, wrong token) |
 | `500`  | `internal_error` |
 
 ### Wire limits
 
 | Field | Rule |
 |-------|------|
-| `text` | required, ≤ 4096 bytes UTF-8 |
+| `text` | required, ≤ `CHAT_MAX_TEXT_BYTES` UTF-8 bytes (default 4096) |
 | `from` | required, 1–64 chars, `[A-Za-z0-9_-]` only |
-| `meta` | optional object, JSON-serialised, ≤ 1024 bytes |
+| `meta` | optional object, JSON-serialised, ≤ `CHAT_MAX_META_BYTES` bytes (default 1024) |
 | `mentions` | **server-derived only** — clients MUST NOT send it |
 | Per-agent publish rate | ≤ 10 msg/s/agent; 11th within a 1 s window → `429` |
 
@@ -121,12 +123,75 @@ All knobs are environment variables, read by `lib/config.js`'s
 | `CHAT_PORT` | `8080` | TCP port |
 | `CHAT_HOST` | `0.0.0.0` | Bind address |
 | `CHAT_HISTORY_LIMIT` | `500` | Per-room ring buffer size |
-| `CHAT_MAX_BODY_BYTES` | `6144` (maxTextBytes + maxMetaBytes + 1024) | HTTP body cap (request rejection). The wire validators cap `text` at 4096 and `meta` at 1024 regardless — raise `CHAT_MAX_BODY_BYTES` only if you also widen the wire limits. |
+| `CHAT_MAX_TEXT_BYTES` | `4096` | Max UTF-8 bytes for the `text` field |
+| `CHAT_MAX_META_BYTES` | `1024` | Max UTF-8 bytes for JSON-serialised `meta` |
+| `CHAT_MAX_BODY_BYTES` | `6144` (maxTextBytes + maxMetaBytes + 1024) | HTTP body cap (request rejection). Set a value higher than the derived cap if your proxy adds headers that inflate the request, or override it independently from the field limits. |
 | `CHAT_RATE_LIMIT_PER_SEC` | `10` | Per-agent publish cap |
 | `CHAT_RATE_LIMIT_WINDOW_MS` | `1000` | Window for the rate limit |
 | `CHAT_STALE_MS` | `60000` | Close an SSE connection after this much server-side silence. Set to ~10s for loud debugging. |
 | `CHAT_SWEEPER_INTERVAL_MS` | `5000` | Stale-SSE sweeper cadence — should be `< staleMs / 4` so the sweeper can fire at least once before a connection ages out. |
 | `CHAT_PING_INTERVAL_MS` | `20000` | Server-side `: ping` keepalive cadence — should be `< staleMs / 2` so a missed ping doesn't immediately reap the connection. At defaults the gap is 1/3, which is intentional. |
+| `CHAT_TLS_CERT` | `""` (disabled) | Path to TLS certificate PEM file. Set together with `CHAT_TLS_KEY` to enable HTTPS. If either is empty/unset the server listens on plain HTTP. |
+| `CHAT_TLS_KEY` | `""` (disabled) | Path to TLS private key PEM file. See `CHAT_TLS_CERT`. |
+| `CHAT_ROOM_TOKENS` | `null` (disabled) | JSON map of room → token, e.g. `{"room1":"secret","room2":null}`. Only string values protect rooms; `null`/absent keys are open. Protected rooms require auth on `POST /messages` and `GET /events`. |
+
+## Security
+
+The chat-server is **open by default** — no auth, plain HTTP. Designed for
+private networks (Docker network, VPN, loopback). Two opt-in mechanisms can
+harden it for wider deployment:
+
+### TLS (HTTPS)
+
+Set **both** `CHAT_TLS_CERT` and `CHAT_TLS_KEY` to the paths of your PEM
+files:
+
+```bash
+export CHAT_TLS_CERT=/certs/server.crt
+export CHAT_TLS_KEY=/certs/server.key
+node server.js
+```
+
+The server fails fast at startup if either file is unreadable. If only one
+of the two is set, the server falls back to plain HTTP (the `listening` log
+field `tls` reflects this accurately). When neither is set, plain HTTP is
+used — this is the default and is backward compatible.
+
+### Room-level access tokens
+
+Set `CHAT_ROOM_TOKENS` to a JSON object mapping room names to tokens:
+
+```bash
+export CHAT_ROOM_TOKENS='{"backend-team":"secret","incidents":"ops-token"}'
+```
+
+- **Protected rooms** have a string token. `POST /messages` and
+  `GET /events` require one of:
+  - `Authorization: Bearer <token>` header (checked first)
+  - `?token=<value>` query parameter (fallback if no Bearer header)
+- **Open rooms** have an absent key or a `null` value (e.g.
+  `{"lobby":null}`). These rooms are unprotected — any request can
+  interact with them.
+- Read endpoints (`GET /history`, `GET /agents`, `POST /heartbeat`) and
+  meta endpoints (`GET /health`, `GET /`) are **always open** regardless
+  of room token configuration.
+- Missing/wrong token → `401 token_required` / `403 invalid_token`.
+- The `roomTokens` config object is `Object.freeze`-d at parse time —
+  immutable at runtime.
+
+### Authentication flow
+
+```
+Request → room in roomTokens?  ─No→  open
+        → value is string?     ─No→  open
+        → Bearer header?       ─Yes→ match?
+        → ?token= query?       ─Yes→ match?
+        → 401 token_required
+```
+
+Tokens are compared with strict string equality. There is no hashing, no
+JWT, no session — this is a simple shared-secret model for trusted internal
+networks.
 
 ## Running tests
 
@@ -183,9 +248,11 @@ docker compose up --build
 docker compose exec pi-alice pi
 ```
 
-> ⚠️ The server has no auth — assume a private network (Docker network, VPN,
-> loopback). Do not expose it directly to the public internet without a
-> reverse proxy that enforces ACLs.
+> ⚠️ The server has no auth by default — assume a private network (Docker
+> network, VPN, loopback). For wider deployment, opt into [room-level access
+> tokens](#room-level-access-tokens) and/or [TLS](#tls-https). Do not expose
+> it directly to the public internet without a reverse proxy that enforces
+> ACLs.
 
 ### Host-only mode (no compose)
 
@@ -224,12 +291,16 @@ chat-server/
 ├── .dockerignore      # excludes test/ + .git from the build context
 ├── server.js          # HTTP routes, factory, graceful shutdown, sweeper
 ├── lib/
+│   ├── auth.js         # checkRoomAccess — room-level token gating
+│   ├── config.js       # loadConfig — env-var → frozen Config
 │   ├── mentions.js    # mention regex + helpers
 │   ├── validation.js  # field limits
 │   ├── state.js       # ServerState, Room, RingBuffer
 │   ├── sse.js         # SseConnection (writeEvent / close / onClose)
 │   └── sweeper.js     # closes stale SSEs after CHAT_STALE_MS
 ├── test/
+│   ├── auth.test.js          # checkRoomAccess unit tests
+│   ├── config.test.js        # loadConfig unit tests
 │   ├── mentions.test.js
 │   ├── validation.test.js
 │   ├── state.test.js

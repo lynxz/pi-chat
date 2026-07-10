@@ -90,6 +90,8 @@ export interface ChatEnv {
    * only the raw inbound message is injected.
    */
   threadContext: boolean;
+  /** room-level access token for auth-protected rooms (CHAT_ROOM_TOKENS on server). Passed as Bearer token on SSE connect and POST. */
+  token?: string;
   /** prefix used when echoing sent messages back into the local session */
   prefix: string;
 }
@@ -140,6 +142,7 @@ const ROOM_FIELDS = [
   "SERVER",
   "ROOM",
   "AGENT",
+  "TOKEN",
   "AUTOREPLY",
   "AUTOREPLY_MODE",
   "HISTORY",
@@ -249,10 +252,13 @@ function resolveOneRoom(
     };
   }
 
+  const token = (get("TOKEN") ?? "").trim() || undefined;
+
   const env: ChatEnv = {
     server,
     room,
     agent,
+    token,
     autoreply: parseAutoreply(get("AUTOREPLY")),
     autoreplyMode: parseMode(get("AUTOREPLY_MODE")),
     history: envIntValue(get("HISTORY"), 20, 1),
@@ -286,6 +292,7 @@ export function readChatEnv(): ChatEnv {
     server: (process.env.PI_CHAT_SERVER ?? "").trim(),
     room: (process.env.PI_CHAT_ROOM ?? "").trim(),
     agent: (process.env.PI_CHAT_AGENT ?? "").trim(),
+    token: (process.env.PI_CHAT_TOKEN ?? "").trim() || undefined,
     autoreply: parseAutoreply(process.env.PI_CHAT_AUTOREPLY),
     autoreplyMode: parseMode(process.env.PI_CHAT_AUTOREPLY_MODE),
     history: envInt("PI_CHAT_HISTORY", 20, 1),

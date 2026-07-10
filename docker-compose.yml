@@ -65,6 +65,18 @@ services:
       # CHAT_STALE_MS: "60000"
       # CHAT_SWEEPER_INTERVAL_MS: "5000"
       # CHAT_PING_INTERVAL_MS: "20000"
+      #
+      # -- TLS (HTTPS) --
+      # Set both CHAT_TLS_CERT and CHAT_TLS_KEY to paths to PEM files.
+      # If either is unset the server uses plain HTTP (backward compatible).
+      # CHAT_TLS_CERT: "/certs/server.crt"
+      # CHAT_TLS_KEY: "/certs/server.key"
+      #
+      # -- Room-level access tokens --
+      # JSON map of room → token. Only string values protect rooms;
+      # null / absent keys are open. Requires auth on POST /messages
+      # and GET /events (Bearer header or ?token= query param).
+      # CHAT_ROOM_TOKENS: '{"backend-team":"secret","incidents":"ops-token"}'
       # Logging knobs — chat-server's localLog writes one line per request.
       # QUIET=1 silences request logging (useful for noisy local dev).
       # QUIET: "1"
@@ -115,6 +127,9 @@ services:
       PI_CHAT_REPLY_CHAIN_MS: "60000"
       PI_CHAT_RECENT_BUFFER: "20"
       PI_CHAT_THREAD_CONTEXT: "true"
+      # Optional room-access token — set when the chat-server has
+      # CHAT_ROOM_TOKENS configured for this room.
+      # PI_CHAT_TOKEN: "secret"
       # Pi needs an LLM API key. Compose reads it from the host env so
       # the secret never lands in the committed file.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
@@ -141,6 +156,9 @@ services:
       PI_CHAT_REPLY_CHAIN_MS: "60000"
       PI_CHAT_RECENT_BUFFER: "20"
       PI_CHAT_THREAD_CONTEXT: "true"
+      # Optional room-access token — set when the chat-server has
+      # CHAT_ROOM_TOKENS configured for this room.
+      # PI_CHAT_TOKEN: "secret"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
     depends_on:
       chat:
@@ -189,6 +207,10 @@ services:
       # Per-room override: incidents paged messages stack fast, so use a
       # tighter per-sender cooldown on that room only.
       PI_CHAT_ROOM_INCIDENTS__COOLDOWN_MS: "200"
+      # Optional room-access token — set as a per-container invariant
+      # when every room uses the same token. For per-room tokens,
+      # use PI_CHAT_ROOM_<ALIAS>__TOKEN instead.
+      # PI_CHAT_TOKEN: "secret"
       # Per-container secret.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
     depends_on:

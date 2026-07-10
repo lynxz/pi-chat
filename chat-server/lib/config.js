@@ -15,15 +15,20 @@
 
 import { LIMITS } from "./validation.js";
 
-/** Numeric defaults shared between env-binding and fallbacks. */
+/** Numeric defaults shared between env-binding and fallbacks.
+ *
+ * `maxTextBytes` and `maxMetaBytes` mirror `LIMITS` from `validation.js`
+ * and are the defaults for the wire-spec field caps. Override them with
+ * `CHAT_MAX_TEXT_BYTES` / `CHAT_MAX_META_BYTES` to widen the limits.
+ * `bodyLimit` is derived: `maxTextBytes + maxMetaBytes + bodySlack`.
+ *
+ * `bodySlack` covers the JSON wrapper around the field-pair body
+ * (`{"from":"…","text":"…","meta":{…}}`) plus a margin for UTF-8
+ * overhead between raw byte count and string length.
+ */
 const DEFAULTS = Object.freeze({
-  // Slack bytes added on top of `LIMITS.maxTextBytes + LIMITS.maxMetaBytes`
-  // to derive the HTTP body cap (6144). Covers the JSON wrapper around the
-  // field-pair body (`{"from":"…","text":"…","meta":{…}}`) plus a margin for
-  // UTF-8 overhead between raw byte count and string length. Raise
-  // `CHAT_MAX_BODY_BYTES` if your deployment accepts larger envelopes —
-  // the wire validators cap text at 4096 / meta at 1024 regardless of this
-  // knob unless you also widen `LIMITS.maxTextBytes` / `LIMITS.maxMetaBytes`.
+  maxTextBytes: 4096,
+  maxMetaBytes: 1024,
   bodySlack: 1024,
   historyLimit: 500,
   rateLimitPerSec: 10,
@@ -33,12 +38,17 @@ const DEFAULTS = Object.freeze({
   pingIntervalMs: 20_000,
   port: 8080,
   host: "0.0.0.0",
+  tlsCert: "",
+  tlsKey: "",
+  roomTokens: null,
 });
 
 /** Env-var names. Keep aligned with README "Configuration". */
 export const CONFIG_ENV_KEYS = Object.freeze({
   port: "CHAT_PORT",
   host: "CHAT_HOST",
+  maxTextBytes: "CHAT_MAX_TEXT_BYTES",
+  maxMetaBytes: "CHAT_MAX_META_BYTES",
   bodyLimit: "CHAT_MAX_BODY_BYTES",
   historyLimit: "CHAT_HISTORY_LIMIT",
   rateLimitPerSec: "CHAT_RATE_LIMIT_PER_SEC",
@@ -46,9 +56,12 @@ export const CONFIG_ENV_KEYS = Object.freeze({
   staleMs: "CHAT_STALE_MS",
   sweeperIntervalMs: "CHAT_SWEEPER_INTERVAL_MS",
   pingIntervalMs: "CHAT_PING_INTERVAL_MS",
+  tlsCert: "CHAT_TLS_CERT",
+  tlsKey: "CHAT_TLS_KEY",
+  roomTokens: "CHAT_ROOM_TOKENS",
 });
 
-const DEFAULT_BODY_LIMIT = LIMITS.maxTextBytes + LIMITS.maxMetaBytes + DEFAULTS.bodySlack;
+const DEFAULT_BODY_LIMIT = DEFAULTS.maxTextBytes + DEFAULTS.maxMetaBytes + DEFAULTS.bodySlack;
 
 /** Strict base-10 integer parse; missing/garbage/non-integer → fallback.
  *
@@ -75,29 +88,58 @@ function parseString(raw, fallback) {
   return String(raw);
 }
 
+/** Parse CHAT_ROOM_TOKENS from its raw env string into a frozen plain object.
+ *
+ * Only plain (non-array) objects survive — arrays, primitives, and invalid
+ * JSON all fall back to `null`. The returned object is `Object.freeze`-d so
+ * consumers cannot accidentally mutate the token map at runtime.
+ *
+ * @param {string|undefined} raw
+ * @returns {Readonly<Record<string,string>> | null}
+ */
+function parseRoomTokens(raw) {
+  if (raw == null || raw === "") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return Object.freeze(parsed);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Build a frozen Config object from `env`. Values match the inline defaults
  * in the rest of the codebase byte-for-byte, so behaviour is identical when
  * no env vars are set.
  *
- * `bodyLimit` defaults to `LIMITS.maxTextBytes + LIMITS.maxMetaBytes + bodySlack`
- * (currently 6144). Override with `CHAT_MAX_BODY_BYTES` if your deployment
- * needs to accept larger payloads than the wire-spec limits imply — but
- * note the wire validators will still reject text > 4096 or meta > 1024
- * unless you also raise `LIMITS.maxTextBytes` / `LIMITS.maxMetaBytes` (which
- * are not currently env-driven; widen the wire spec first).
+ * `maxTextBytes` / `maxMetaBytes` default to 4096 / 1024 and can be widened
+ * via `CHAT_MAX_TEXT_BYTES` / `CHAT_MAX_META_BYTES`. `bodyLimit` is derived
+ * from them: `maxTextBytes + maxMetaBytes + bodySlack` (default 6144).
+ * Set `CHAT_MAX_BODY_BYTES` to override the derived body cap independently
+ * (useful when you widen the field limits without recalculating).
  *
  * @param {Record<string, string|undefined>} [env=process.env]
  * @returns {Readonly<Config>}
  */
 export function loadConfig(env = process.env) {
+  const maxTextBytes = parseIntStrict(
+    env[CONFIG_ENV_KEYS.maxTextBytes],
+    DEFAULTS.maxTextBytes,
+  );
+  const maxMetaBytes = parseIntStrict(
+    env[CONFIG_ENV_KEYS.maxMetaBytes],
+    DEFAULTS.maxMetaBytes,
+  );
   const bodyLimit = parseIntStrict(
     env[CONFIG_ENV_KEYS.bodyLimit],
-    DEFAULT_BODY_LIMIT,
+    maxTextBytes + maxMetaBytes + DEFAULTS.bodySlack,
   );
   return Object.freeze({
     port: parseIntStrict(env[CONFIG_ENV_KEYS.port], DEFAULTS.port),
     host: parseString(env[CONFIG_ENV_KEYS.host], DEFAULTS.host),
+    maxTextBytes,
+    maxMetaBytes,
     bodyLimit,
     historyLimit: parseIntStrict(env[CONFIG_ENV_KEYS.historyLimit], DEFAULTS.historyLimit),
     rateLimitPerSec: parseIntStrict(env[CONFIG_ENV_KEYS.rateLimitPerSec], DEFAULTS.rateLimitPerSec),
@@ -105,6 +147,9 @@ export function loadConfig(env = process.env) {
     staleMs: parseIntStrict(env[CONFIG_ENV_KEYS.staleMs], DEFAULTS.staleMs),
     sweeperIntervalMs: parseIntStrict(env[CONFIG_ENV_KEYS.sweeperIntervalMs], DEFAULTS.sweeperIntervalMs),
     pingIntervalMs: parseIntStrict(env[CONFIG_ENV_KEYS.pingIntervalMs], DEFAULTS.pingIntervalMs),
+    tlsCert: parseString(env[CONFIG_ENV_KEYS.tlsCert], DEFAULTS.tlsCert),
+    tlsKey: parseString(env[CONFIG_ENV_KEYS.tlsKey], DEFAULTS.tlsKey),
+    roomTokens: parseRoomTokens(env[CONFIG_ENV_KEYS.roomTokens]),
   });
 }
 
@@ -112,6 +157,8 @@ export function loadConfig(env = process.env) {
  * @typedef {{
  *   port: number,
  *   host: string,
+ *   maxTextBytes: number,
+ *   maxMetaBytes: number,
  *   bodyLimit: number,
  *   historyLimit: number,
  *   rateLimitPerSec: number,
@@ -119,6 +166,9 @@ export function loadConfig(env = process.env) {
  *   staleMs: number,
  *   sweeperIntervalMs: number,
  *   pingIntervalMs: number,
+ *   tlsCert: string,
+ *   tlsKey: string,
+ *   roomTokens: Readonly<Record<string,string>> | null,
  * }} Config
  */
 

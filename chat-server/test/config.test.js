@@ -7,7 +7,6 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { loadConfig, CONFIG_DEFAULTS, CONFIG_ENV_KEYS } from "../lib/config.js";
-import { LIMITS } from "../lib/validation.js";
 
 /** An "empty" env: `loadConfig` falls back to defaults. */
 const EMPTY_ENV = Object.freeze({});
@@ -23,15 +22,25 @@ describe("loadConfig — defaults", () => {
     assert.equal(c.staleMs, CONFIG_DEFAULTS.staleMs);
     assert.equal(c.sweeperIntervalMs, CONFIG_DEFAULTS.sweeperIntervalMs);
     assert.equal(c.pingIntervalMs, CONFIG_DEFAULTS.pingIntervalMs);
+    // New TLS / room-token fields default to empty string / null.
+    assert.equal(c.tlsCert, "");
+    assert.equal(c.tlsKey, "");
+    assert.equal(c.roomTokens, null);
   });
 
   it("bodyLimit defaults to maxTextBytes + maxMetaBytes + slack (6144)", () => {
     // `bodyLimit` is a derived field — confirm the formula matches
-    // `LIMITS` so the wire limits and the HTTP cap stay in sync.
+    // `DEFAULTS` so the wire limits and the HTTP cap stay in sync.
     const c = loadConfig(EMPTY_ENV);
-    const expected = LIMITS.maxTextBytes + LIMITS.maxMetaBytes + CONFIG_DEFAULTS.bodySlack;
+    const expected = CONFIG_DEFAULTS.maxTextBytes + CONFIG_DEFAULTS.maxMetaBytes + CONFIG_DEFAULTS.bodySlack;
     assert.equal(c.bodyLimit, expected);
     assert.equal(c.bodyLimit, 6144); // sanity-pin: 4096 + 1024 + 1024
+  });
+
+  it("exposes maxTextBytes and maxMetaBytes defaults", () => {
+    const c = loadConfig(EMPTY_ENV);
+    assert.equal(c.maxTextBytes, 4096);
+    assert.equal(c.maxMetaBytes, 1024);
   });
 
   it("returns a host default of 0.0.0.0", () => {
@@ -62,9 +71,41 @@ describe("loadConfig — env overrides", () => {
     assert.equal(c.bodyLimit, 8192);
   });
 
+  it("parses CHAT_MAX_TEXT_BYTES and CHAT_MAX_META_BYTES env vars", () => {
+    const c = loadConfig({
+      CHAT_MAX_TEXT_BYTES: "8192",
+      CHAT_MAX_META_BYTES: "2048",
+    });
+    assert.equal(c.maxTextBytes, 8192);
+    assert.equal(c.maxMetaBytes, 2048);
+    // bodyLimit derives from the new values: 8192 + 2048 + 1024 = 11264
+    assert.equal(c.bodyLimit, 11264);
+  });
+
+  it("CHAT_MAX_BODY_BYTES overrides the derived body limit independently", () => {
+    const c = loadConfig({
+      CHAT_MAX_TEXT_BYTES: "8192",
+      CHAT_MAX_META_BYTES: "2048",
+      CHAT_MAX_BODY_BYTES: "16384",
+    });
+    assert.equal(c.maxTextBytes, 8192);
+    assert.equal(c.maxMetaBytes, 2048);
+    // bodyLimit is explicitly overridden, ignoring the derivation
+    assert.equal(c.bodyLimit, 16384);
+  });
+
   it("parses a string env var (host)", () => {
     const c = loadConfig({ CHAT_HOST: "127.0.0.1" });
     assert.equal(c.host, "127.0.0.1");
+  });
+
+  it("parses TLS cert and key paths as strings (same parseString as host)", () => {
+    const c = loadConfig({
+      CHAT_TLS_CERT: "/etc/certs/server.crt",
+      CHAT_TLS_KEY: "/etc/certs/server.key",
+    });
+    assert.equal(c.tlsCert, "/etc/certs/server.crt");
+    assert.equal(c.tlsKey, "/etc/certs/server.key");
   });
 
   it("ignores garbage values (non-numeric, negative) and falls back", () => {
@@ -132,6 +173,8 @@ describe("CONFIG_ENV_KEYS — public surface", () => {
     // Failures here usually mean the README needs an update too.
     assert.equal(CONFIG_ENV_KEYS.port, "CHAT_PORT");
     assert.equal(CONFIG_ENV_KEYS.host, "CHAT_HOST");
+    assert.equal(CONFIG_ENV_KEYS.maxTextBytes, "CHAT_MAX_TEXT_BYTES");
+    assert.equal(CONFIG_ENV_KEYS.maxMetaBytes, "CHAT_MAX_META_BYTES");
     assert.equal(CONFIG_ENV_KEYS.bodyLimit, "CHAT_MAX_BODY_BYTES");
     assert.equal(CONFIG_ENV_KEYS.historyLimit, "CHAT_HISTORY_LIMIT");
     assert.equal(CONFIG_ENV_KEYS.rateLimitPerSec, "CHAT_RATE_LIMIT_PER_SEC");
@@ -143,5 +186,43 @@ describe("CONFIG_ENV_KEYS — public surface", () => {
 
   it("CONFIG_ENV_KEYS is itself frozen", () => {
     assert.equal(Object.isFrozen(CONFIG_ENV_KEYS), true);
+  });
+
+  it("exposes the new TLS and room-token env-var names", () => {
+    assert.equal(CONFIG_ENV_KEYS.tlsCert, "CHAT_TLS_CERT");
+    assert.equal(CONFIG_ENV_KEYS.tlsKey, "CHAT_TLS_KEY");
+    assert.equal(CONFIG_ENV_KEYS.roomTokens, "CHAT_ROOM_TOKENS");
+  });
+});
+
+describe("loadConfig — roomTokens parsing", () => {
+  it("parses valid JSON into a frozen object", () => {
+    const c = loadConfig({ CHAT_ROOM_TOKENS: '{"lobby":"secret","ops":"x"}' });
+    const tokens = c.roomTokens;
+    assert.notEqual(tokens, null);
+    assert.equal(typeof tokens, "object");
+    assert.equal(tokens.lobby, "secret");
+    assert.equal(tokens.ops, "x");
+    assert.equal(Object.isFrozen(tokens), true);
+  });
+
+  it("returns null for invalid JSON", () => {
+    const c = loadConfig({ CHAT_ROOM_TOKENS: "not json" });
+    assert.equal(c.roomTokens, null);
+  });
+
+  it("returns null for an array", () => {
+    const c = loadConfig({ CHAT_ROOM_TOKENS: '["a","b"]' });
+    assert.equal(c.roomTokens, null);
+  });
+
+  it("returns null for a number", () => {
+    const c = loadConfig({ CHAT_ROOM_TOKENS: "42" });
+    assert.equal(c.roomTokens, null);
+  });
+
+  it("returns null for the string 'null'", () => {
+    const c = loadConfig({ CHAT_ROOM_TOKENS: "null" });
+    assert.equal(c.roomTokens, null);
   });
 });

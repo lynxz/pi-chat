@@ -26,6 +26,8 @@ export interface ChatClientConfig {
   room: string;              // room name
   agent: string;             // this agent's name (URL-safe)
   reconnectMs?: number;      // base backoff (default 2000)
+  /** Room-level access token — sent as Bearer token on SSE connect and POST. */
+  token?: string;
   /** Override `fetch` — used by tests. */
   fetch?: typeof globalThis.fetch;
 }
@@ -94,6 +96,7 @@ const MAX_BACKOFF_MS = 30_000;
 export class ChatClient {
   private readonly config: Required<Pick<ChatClientConfig, "server" | "room" | "agent" | "reconnectMs">> & {
     fetch: typeof globalThis.fetch;
+    token?: string;
   };
 
   private statusListeners = new Set<Listener<ClientStatus>>();
@@ -115,7 +118,11 @@ export class ChatClient {
       room: config.room,
       agent: config.agent,
       reconnectMs: config.reconnectMs ?? 2000,
+      token: config.token,
       fetch: config.fetch ?? globalThis.fetch,
+    } as Required<Pick<ChatClientConfig, "server" | "room" | "agent" | "reconnectMs">> & {
+      fetch: typeof globalThis.fetch;
+      token?: string;
     };
   }
 
@@ -186,9 +193,11 @@ export class ChatClient {
     if (meta !== undefined) body.meta = meta;
     let res: Response;
     try {
+      const sendHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      if (this.config.token) sendHeaders.Authorization = `Bearer ${this.config.token}`;
       res = await this.config.fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: sendHeaders,
         body: JSON.stringify(body),
       });
     } catch (error) {
@@ -239,7 +248,10 @@ export class ChatClient {
     try {
       sse = await openSse(
         `${this.config.server}/rooms/${encodeURIComponent(this.config.room)}/events?agent=${encodeURIComponent(this.config.agent)}`,
-        { fetch: this.config.fetch },
+        {
+          fetch: this.config.fetch,
+          ...(this.config.token ? { headers: { Authorization: `Bearer ${this.config.token}` } } : {}),
+        },
       );
     } catch (error) {
       this.emitError({ phase: "connect", error });
