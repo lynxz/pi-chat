@@ -27,7 +27,7 @@ import { SseConnection } from "./lib/sse.js";
 import { startStaleSweeper, stopStaleSweeper } from "./lib/sweeper.js";
 import { checkRoomAccess } from "./lib/auth.js";
 import { startPingScheduler, stopPingScheduler } from "./lib/ping-scheduler.js";
-import { loadConfig } from "./lib/config.js";
+import { loadConfig, loadConfigFromFile } from "./lib/config.js";
 
 // --- constants ------------------------------------------------------------
 
@@ -43,6 +43,44 @@ const SHUTDOWN_HARD_EXIT_MS = 5_000;
 // Path regexes — kept at module top so the dispatcher is purely declarative
 // and the room-name capture lives in one place per route.
 const HEALTH_PATH_RE = /^\/health\/?$/;
+
+/**
+ * Parse the tiny CLI flag surface the chat-server entry block supports.
+ *
+ * Currently only `--config <path>` (alias `-c`) — points the server at a
+ * JSON config file that layers under `process.env`. CLI wins over
+ * `CHAT_CONFIG_FILE` because that's the standard convention (an explicit
+ * flag beats an ambient env var).
+ *
+ * Supports the two usual shapes:
+ *   --config /path/to/file.json
+ *   --config=/path/to/file.json
+ *
+ * Unknown flags are silently ignored so we don't break forward-compat
+ * with new flags added in future versions. The argument parser is
+ * deliberately tiny — there is no `commander` / `yargs` dependency, and
+ * the chat-server's contract is "zero runtime deps".
+ *
+ * @param {string[]} argv Typically `process.argv.slice(2)`.
+ * @returns {{ configFile?: string }}
+ */
+export function parseCliArgs(argv) {
+  const out = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--config" || arg === "-c") {
+      const val = argv[i + 1];
+      if (val === undefined || val.startsWith("--")) {
+        throw new Error(`--config requires a path argument`);
+      }
+      out.configFile = val;
+      i++;
+    } else if (arg.startsWith("--config=")) {
+      out.configFile = arg.slice("--config=".length);
+    }
+  }
+  return out;
+}
 const INDEX_PATH_RE = /^\/?$/;
 const MSG_PATH_RE = /^\/rooms\/([^/]+)\/messages\/?$/;
 const EVENTS_PATH_RE = /^\/rooms\/([^/]+)\/events\/?$/;
@@ -328,13 +366,19 @@ function dispatch(req, res, ctx, url, method, path) {
  * Configuration resolution order (highest priority first):
  *   1. `opts` (per-call override — used by tests)
  *   2. `env` passed via `opts.env` (defaults to `process.env`)
- *   3. Defaults (frozen `Config` from `lib/config.js`)
+ *   3. JSON config file from `opts.configFile` or `CHAT_CONFIG_FILE` / `--config`
+ *   4. Defaults (frozen `Config` from `lib/config.js`)
  *
- * The per-call `env` parameter is plumbed through to `loadConfig()` so test
- * suites can isolate env binding without polluting `process.env`.
+ * `opts.env` is the test seam; `opts.configFile` lets the caller (and the
+ * CLI entry block) point at a JSON file. CLI (`--config`) wins over
+ * `CHAT_CONFIG_FILE` because an explicit flag beats an ambient env var.
+ * The file is layered *under* `opts.env` via `loadConfigFromFile`, so
+ * env vars beat file entries on key collision. A missing / unreadable /
+ * malformed file throws — fail fast at startup, before the server binds.
  *
  * @param {{
  *   env?: Record<string, string|undefined>,  // override env for testing
+ *   configFile?: string,                     // path to a JSON config file
  *   port?: number,
  *   host?: string,
  *   maxTextBytes?: number,
@@ -354,9 +398,16 @@ function dispatch(req, res, ctx, url, method, path) {
  * @example
  *   // Bind env from a stub object (no `process.env` mutation):
  *   createChatServer({ env: { CHAT_PORT: "0", CHAT_STALE_MS: "500" } })
+ *
+ * @example
+ *   // Layer a JSON config file under process.env:
+ *   createChatServer({ configFile: "/etc/chat-server.json" })
  */
 export function createChatServer(opts = {}) {
-  const env = opts.env ?? process.env;
+  const baseEnv = opts.env ?? process.env;
+  // CLI flag (via `opts.configFile`) wins over the env var.
+  const configFile = opts.configFile ?? baseEnv.CHAT_CONFIG_FILE;
+  const env = configFile ? loadConfigFromFile(configFile, baseEnv) : baseEnv;
   const config = loadConfig(env);
 
   const port = opts.port ?? config.port;
@@ -527,7 +578,20 @@ if (_isMain) {
   // `shutdown()` is a clean Promise so tests can await it without
   // triggering an exit. The `SHUTDOWN_HARD_EXIT_MS` timer is the safety
   // net for a true hang.
-  const runtime = createChatServer();
+  //
+  // CLI flags (currently only `--config <path>`) are parsed before the
+  // factory call so a missing / unreadable / malformed config file
+  // surfaces as a fatal startup error rather than a deferred runtime
+  // surprise. `CHAT_CONFIG_FILE` is honoured when no flag is passed.
+  let cliOpts;
+  try {
+    cliOpts = parseCliArgs(process.argv.slice(2));
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error(e.message);
+    process.exit(2);
+  }
+  const runtime = createChatServer(cliOpts);
   runtime.start();
   const onSignal = (sig) => {
     const hardExit = setTimeout(() => process.exit(1), SHUTDOWN_HARD_EXIT_MS);

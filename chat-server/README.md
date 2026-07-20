@@ -118,6 +118,46 @@ All knobs are environment variables, read by `lib/config.js`'s
 `createChatServer({ env })` call). The env-var name table is exported as
 `CONFIG_ENV_KEYS` so deployments can read it programmatically.
 
+For deployments where a flat env-var block isn't convenient (Docker
+compose sprawl, secret-manager templating, etc.), every knob can also
+live in a JSON config file. Point at the file via `CHAT_CONFIG_FILE`
+(env var) or `--config <path>` (CLI flag). The file layers *under*
+`process.env`, so any knob present in both is taken from the env:
+
+```
+process.env  >  config file  >  built-in defaults
+```
+
+Missing / unreadable / malformed files fail fast at startup — an
+operator typo surfaces immediately, not on the first request that
+depends on a missing key. File values are string-coerced to match env
+semantics: numbers / booleans stringify, `null` becomes `""`,
+arrays / objects are rejected (JSON-encode them).
+
+```bash
+# config-file only
+CHAT_CONFIG_FILE=/etc/chat-server.json node server.js
+
+# CLI flag wins over the env var
+node server.js --config /etc/chat-server.json
+```
+
+```json
+// /etc/chat-server.json
+{
+  "CHAT_PORT": "8080",
+  "CHAT_HISTORY_LIMIT": "500",
+  "CHAT_TLS_CERT": "/certs/server.crt",
+  "CHAT_TLS_KEY": "/certs/server.key",
+  "CHAT_ROOM_TOKENS": "{\"backend-team\":\"secret\",\"incidents\":\"ops-token\"}"
+}
+```
+
+File values are NOT validated against `CONFIG_ENV_KEYS` — extra keys
+are ignored at parse time, and removing a key from the file reverts it
+to the built-in default. The same key names are used in both the env
+and the file (e.g. `CHAT_PORT`); there is no separate "file schema".
+
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CHAT_PORT` | `8080` | TCP port |
@@ -134,6 +174,7 @@ All knobs are environment variables, read by `lib/config.js`'s
 | `CHAT_TLS_CERT` | `""` (disabled) | Path to TLS certificate PEM file. Set together with `CHAT_TLS_KEY` to enable HTTPS. If either is empty/unset the server listens on plain HTTP. |
 | `CHAT_TLS_KEY` | `""` (disabled) | Path to TLS private key PEM file. See `CHAT_TLS_CERT`. |
 | `CHAT_ROOM_TOKENS` | `null` (disabled) | JSON map of room → token, e.g. `{"room1":"secret","room2":null}`. Only string values protect rooms; `null`/absent keys are open. Protected rooms require auth on `POST /messages` and `GET /events`. |
+| `CHAT_CONFIG_FILE` | unset | Path to a JSON file whose keys mirror the env-var names above. Layered under `process.env`, so env vars beat file entries on key collision. See [Configuration](#configuration) for the precedence rule and an example. Missing / unreadable / malformed files fail fast at startup. The `--config <path>` CLI flag is an alias and wins over the env var. |
 
 ## Security
 

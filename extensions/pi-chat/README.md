@@ -234,6 +234,7 @@ room with alias `DEFAULT`.
 | `PI_CHAT_RECENT_BUFFER` | no | `20` | Ring-buffer size of recent messages kept for thread-context injection |
 | `PI_CHAT_THREAD_CONTEXT` | no | `true` | If `false`, inbound auto-replies only see the new message (no thread pre-amble) |
 | `PI_CHAT_PREFIX` | no | `[chat {agent}]` | Prefix for inbound auto-replies; `{agent}` is substituted |
+| `PI_CHAT_CONFIG_FILE` | no | unset | Path to a JSON file whose keys mirror the env-var names in this table. Layered under `process.env`, so env vars beat file entries on key collision. See [Config file](#config-file-pi_chat_config_file) below for an example. Missing / unreadable / malformed files fail fast at startup. |
 
 ### Multi-room — prefixed per-room vars
 
@@ -287,6 +288,54 @@ environment:
 Agent name uniqueness is per-room — `PI_CHAT_ROOM_BACKEND__AGENT=alice`
 and `PI_CHAT_ROOM_INCIDENTS__AGENT=alice` are fine; the server keys
 uniqueness on `(room, agent)`.
+
+### Config file (`PI_CHAT_CONFIG_FILE`)
+
+For deployments where a flat env-var block isn't convenient (Docker
+compose sprawl, secret-manager templating, per-team config sharing),
+every `PI_CHAT_*` env var can also live in a JSON file pointed at via
+`PI_CHAT_CONFIG_FILE`. The file layers *under* `process.env`, so any
+knob present in both is taken from the env:
+
+```
+process.env  >  config file  >  built-in defaults
+```
+
+This means per-room prefixed keys (`PI_CHAT_ROOM_<ALIAS>__<FIELD>`)
+work in the file exactly as they do in the env — `readChatEnvs()` walks
+the merged map the same way. The compose-pattern fallback chain
+(per-alias > flat > default) keeps working because the file becomes
+the lowest layer; env vars still override it.
+
+```bash
+PI_CHAT_CONFIG_FILE=/etc/pi-chat.json pi
+```
+
+```json
+// /etc/pi-chat.json
+{
+  "PI_CHAT_SERVER": "http://chat:8080",
+  "PI_CHAT_AGENT": "alice",
+  "PI_CHAT_COOLDOWN_MS": "2000",
+  "PI_CHAT_AUTOREPLY": "true",
+  "PI_CHAT_ROOM_BACKEND__ROOM": "backend-team",
+  "PI_CHAT_ROOM_BACKEND__AUTOREPLY_MODE": "questions",
+  "PI_CHAT_ROOM_INCIDENTS__ROOM": "incidents",
+  "PI_CHAT_ROOM_INCIDENTS__AUTOREPLY_MODE": "all",
+  "PI_CHAT_ROOM_INCIDENTS__COOLDOWN_MS": "200"
+}
+```
+
+File values are string-coerced to match env semantics: numbers /
+booleans stringify, `null` becomes `""`, arrays / objects are rejected
+(JSON-encode them). Missing / unreadable / malformed files fail fast at
+extension startup — the operator sees the error via `ctx.ui.notify`,
+not a silent dormant mode.
+
+The per-container invariant rule ("a per-container invariant should
+never appear in a per-room key") still applies to the file: put shared
+values at the top level of the JSON, put per-room deltas under
+`PI_CHAT_ROOM_<ALIAS>__*`.
 
 ### Compose patterns
 

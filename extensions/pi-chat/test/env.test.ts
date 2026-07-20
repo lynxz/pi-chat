@@ -2,6 +2,9 @@
 
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   readChatEnv,
@@ -11,6 +14,7 @@ import {
   describeEnv,
   normaliseAlias,
   parseRoomKey,
+  loadConfigFromFile,
 } from "../env.ts";
 
 /** Snapshot env vars and restore them after each test. */
@@ -439,5 +443,317 @@ describe("compose-pattern fallback (docker-compose example)", () => {
     assert.equal(incidents.env.agent, "alice", "agent from flat");
     assert.equal(incidents.env.room, "incidents");
     assert.equal(incidents.env.cooldownMs, 200, "cooldownMs per-room override wins over flat");
+  });
+});
+
+// --- config-file support --------------------------------------------------
+//
+// `PI_CHAT_CONFIG_FILE` (env var) points the runtime at a JSON file that
+// layers *under* `process.env` via `loadConfigFromFile`. The file format
+// mirrors the env-var namespace verbatim — `PI_CHAT_SERVER`,
+// `PI_CHAT_ROOM_<ALIAS>__<FIELD>`, etc. The precedence is:
+//
+//   process.env (or test's `env`) > file entries > hard-coded defaults.
+//
+// `readChatEnv` and `readChatEnvs` are pure: they take an env map and do
+// no I/O. The file-loading layer lives in `loadConfigFromFile`; the
+// wiring layer (`buildChatRuntime`) calls it once at startup and passes
+// the merged map in.
+describe("loadConfigFromFile", () => {
+  let tmpDir: string;
+  let tmpFiles: string[];
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "pi-chat-cfg-"));
+    tmpFiles = [];
+  });
+  afterEach(() => {
+    for (const f of tmpFiles) {
+      try { rmSync(f); } catch { /* best-effort cleanup */ }
+    }
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* same */ }
+  });
+
+  /** Write a JSON file under the per-test tmp dir and return its path. */
+  function writeJson(obj: unknown): string {
+    const p = join(tmpDir, `cfg-${tmpFiles.length}.json`);
+    writeFileSync(p, JSON.stringify(obj));
+    tmpFiles.push(p);
+    return p;
+  }
+
+  it("returns a flat env map from a valid JSON file", () => {
+    const p = writeJson({
+      PI_CHAT_SERVER: "http://chat:8080",
+      PI_CHAT_ROOM: "team",
+    });
+    const merged = loadConfigFromFile(p);
+    assert.equal(merged.PI_CHAT_SERVER, "http://chat:8080");
+    assert.equal(merged.PI_CHAT_ROOM, "team");
+  });
+
+  it("default baseEnv is process.env (file layered underneath)", () => {
+    const p = writeJson({ PI_CHAT_SERVER: "http://file:9090" });
+    const snapshot = process.env.PI_CHAT_SERVER;
+    process.env.PI_CHAT_SERVER = "http://env:7777";
+    try {
+      const merged = loadConfigFromFile(p);
+      assert.equal(merged.PI_CHAT_SERVER, "http://env:7777", "env beats file");
+    } finally {
+      if (snapshot === undefined) delete process.env.PI_CHAT_SERVER;
+      else process.env.PI_CHAT_SERVER = snapshot;
+    }
+  });
+
+  it("baseEnv beats file on key collision (explicit baseEnv)", () => {
+    const p = writeJson({
+      PI_CHAT_SERVER: "http://file:9090",
+      PI_CHAT_ROOM: "file-room",
+    });
+    const merged = loadConfigFromFile(p, { PI_CHAT_SERVER: "http://env:8888" });
+    assert.equal(merged.PI_CHAT_SERVER, "http://env:8888", "baseEnv wins");
+    assert.equal(merged.PI_CHAT_ROOM, "file-room", "file still fills missing keys");
+  });
+
+  it("throws when the file does not exist (fail-fast at startup)", () => {
+    assert.throws(
+      () => loadConfigFromFile("/nonexistent/pi-chat-config.json"),
+      /cannot read/,
+    );
+  });
+
+  it("throws when the file is not valid JSON", () => {
+    const p = join(tmpDir, "bad.json");
+    writeFileSync(p, "{not json}");
+    tmpFiles.push(p);
+    assert.throws(() => loadConfigFromFile(p), /invalid JSON/);
+  });
+
+  it("throws when the top-level value is not an object", () => {
+    const p1 = writeJson([1, 2, 3]);
+    assert.throws(() => loadConfigFromFile(p1), /expected a JSON object/);
+    const p2 = writeJson("just a string");
+    assert.throws(() => loadConfigFromFile(p2), /expected a JSON object/);
+    const p3 = writeJson(42);
+    assert.throws(() => loadConfigFromFile(p3), /expected a JSON object/);
+    const p4 = writeJson(null);
+    assert.throws(() => loadConfigFromFile(p4), /expected a JSON object/);
+  });
+
+  it("coerces numbers and booleans to strings (env-var semantics)", () => {
+    const p = writeJson({
+      PI_CHAT_HISTORY: 50,
+      PI_CHAT_AUTOREPLY: true,
+      PI_CHAT_AUTOREPLY_FALSE: false,
+    });
+    const merged = loadConfigFromFile(p);
+    assert.equal(merged.PI_CHAT_HISTORY, "50");
+    assert.equal(merged.PI_CHAT_AUTOREPLY, "true");
+    assert.equal(merged.PI_CHAT_AUTOREPLY_FALSE, "false");
+  });
+
+  it("treats null values as the empty string (env unset == \"\")", () => {
+    const p = writeJson({ PI_CHAT_SERVER: null, PI_CHAT_ROOM: null });
+    const merged = loadConfigFromFile(p);
+    assert.equal(merged.PI_CHAT_SERVER, "");
+    assert.equal(merged.PI_CHAT_ROOM, "");
+  });
+
+  it("throws on array values (use a JSON-encoded string instead)", () => {
+    const p = writeJson({ PI_CHAT_HISTORY: [1, 2, 3] });
+    assert.throws(
+      () => loadConfigFromFile(p),
+      /not supported|JSON-encoded string/,
+    );
+  });
+
+  it("throws on object values (use a JSON-encoded string instead)", () => {
+    const p = writeJson({ PI_CHAT_PREFIX: { key: "value" } });
+    assert.throws(
+      () => loadConfigFromFile(p),
+      /not supported|JSON-encoded string/,
+    );
+  });
+
+  it("empty object file is equivalent to no file", () => {
+    const p = writeJson({});
+    const merged = loadConfigFromFile(p);
+    // The merged env still contains the host process.env entries
+    // (file is layered under, not on top); the file itself contributes
+    // nothing observable. The crucial behaviour is that nothing throws.
+    assert.equal(typeof merged, "object");
+  });
+});
+
+// --- file-merged env flowing into readChatEnv / readChatEnvs -------------
+//
+// The runtime seam: `buildChatRuntime` calls `loadConfigFromFile` once,
+// passes the merged map into `readChatEnv` / `readChatEnvs`, and gets
+// the documented precedence for free. These tests exercise that path
+// end-to-end without the actual runtime / Pi surface.
+describe("readChatEnv / readChatEnvs — env parameter", () => {
+  it("readChatEnv(env) reads from the provided map", () => {
+    const env: NodeJS.ProcessEnv = {
+      PI_CHAT_SERVER: "http://merged:8080",
+      PI_CHAT_ROOM: "merged-room",
+      PI_CHAT_AGENT: "merged-agent",
+      PI_CHAT_HISTORY: "77",
+    };
+    const e = readChatEnv(env);
+    assert.equal(e.server, "http://merged:8080");
+    assert.equal(e.room, "merged-room");
+    assert.equal(e.agent, "merged-agent");
+    assert.equal(e.history, 77);
+  });
+
+  it("readChatEnvs(env) discovers rooms from the provided map", () => {
+    const env: NodeJS.ProcessEnv = {
+      PI_CHAT_ROOM_BACKEND__SERVER: "http://merged:8080",
+      PI_CHAT_ROOM_BACKEND__ROOM: "backend-team",
+      PI_CHAT_ROOM_BACKEND__AGENT: "alice",
+    };
+    const r = readChatEnvs(env);
+    assert.equal(r.rooms.length, 1);
+    assert.equal(r.rooms[0].alias, "BACKEND");
+    assert.equal(r.rooms[0].env.server, "http://merged:8080");
+  });
+
+  it("readChatEnvs(env) handles the 'both flat and prefixed' case from the map", () => {
+    const env: NodeJS.ProcessEnv = {
+      PI_CHAT_SERVER: "http://flat:9999",
+      PI_CHAT_ROOM: "flat-room",
+      PI_CHAT_AGENT: "flat-agent",
+      PI_CHAT_ROOM_BACKEND__SERVER: "http://merged:8080",
+      PI_CHAT_ROOM_BACKEND__ROOM: "backend-team",
+      // AGENT intentionally omitted — falls back to flat PI_CHAT_AGENT.
+    };
+    const r = readChatEnvs(env);
+    assert.equal(r.rooms.length, 1);
+    assert.equal(r.rooms[0].alias, "BACKEND");
+    assert.equal(r.rooms[0].env.server, "http://merged:8080");
+    assert.equal(r.rooms[0].env.room, "backend-team");
+    assert.equal(r.rooms[0].env.agent, "flat-agent", "fell back to flat");
+    assert.ok(
+      r.warnings.some((w) => w.includes("both set")),
+      `expected a 'both set' warning; got: ${r.warnings.join(" | ")}`,
+    );
+  });
+});
+
+describe("file + env precedence (env > file > default)", () => {
+  let tmpDir: string;
+  let tmpFiles: string[];
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "pi-chat-prec-"));
+    tmpFiles = [];
+  });
+  afterEach(() => {
+    for (const f of tmpFiles) {
+      try { rmSync(f); } catch { /* best-effort */ }
+    }
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* same */ }
+  });
+  function writeJson(obj: unknown): string {
+    const p = join(tmpDir, `cfg-${tmpFiles.length}.json`);
+    writeFileSync(p, JSON.stringify(obj));
+    tmpFiles.push(p);
+    return p;
+  }
+
+  it("file-only flat keys synthesise the DEFAULT room (no longer dormant)", () => {
+    const p = writeJson({
+      PI_CHAT_SERVER: "http://chat:8080",
+      PI_CHAT_ROOM: "team",
+      PI_CHAT_AGENT: "alice",
+    });
+    const merged = loadConfigFromFile(p, {});
+    const r = readChatEnvs(merged);
+    assert.equal(r.rooms.length, 1);
+    assert.equal(r.rooms[0].alias, "DEFAULT");
+    assert.equal(r.rooms[0].env.server, "http://chat:8080");
+    assert.equal(r.rooms[0].env.room, "team");
+    assert.equal(r.rooms[0].env.agent, "alice");
+  });
+
+  it("file-only prefixed keys discover rooms identically to env-set keys", () => {
+    const p = writeJson({
+      PI_CHAT_ROOM_BACKEND__SERVER: "http://chat:8080",
+      PI_CHAT_ROOM_BACKEND__ROOM: "backend-team",
+      PI_CHAT_ROOM_BACKEND__AGENT: "alice",
+      PI_CHAT_ROOM_INCIDENTS__SERVER: "http://chat:8080",
+      PI_CHAT_ROOM_INCIDENTS__ROOM: "incidents",
+      PI_CHAT_ROOM_INCIDENTS__AGENT: "alice-oncall",
+    });
+    const merged = loadConfigFromFile(p, {});
+    const r = readChatEnvs(merged);
+    assert.equal(r.rooms.length, 2);
+    assert.equal(r.rooms[0].alias, "BACKEND");
+    assert.equal(r.rooms[0].env.room, "backend-team");
+    assert.equal(r.rooms[1].alias, "INCIDENTS");
+    assert.equal(r.rooms[1].env.room, "incidents");
+  });
+
+  it("env var beats file on the same key (per-field override)", () => {
+    // File says agent=alice; env says agent=eve. Env wins on collision.
+    const p = writeJson({
+      PI_CHAT_ROOM_BACKEND__SERVER: "http://chat:8080",
+      PI_CHAT_ROOM_BACKEND__ROOM: "backend-team",
+      PI_CHAT_ROOM_BACKEND__AGENT: "alice",
+      PI_CHAT_HISTORY: "20",
+    });
+    // Build a base env that overrides just the agent and history.
+    const baseEnv: NodeJS.ProcessEnv = {
+      PI_CHAT_ROOM_BACKEND__AGENT: "eve",
+      PI_CHAT_HISTORY: "99",
+    };
+    const merged = loadConfigFromFile(p, baseEnv);
+    const r = readChatEnvs(merged);
+    assert.equal(r.rooms.length, 1);
+    assert.equal(r.rooms[0].env.agent, "eve", "env beats file on per-room field");
+    assert.equal(r.rooms[0].env.history, 99, "env beats file on flat field");
+  });
+
+  it("file flat PI_CHAT_* acts as fallback for file prefixed keys (compose pattern)", () => {
+    // Same shape as the docker-compose README example, but loaded from
+    // a file rather than the host env. Per-room keys fill in the
+    // room-specific bits; flat file keys provide the per-container
+    // invariants that all rooms share.
+    const p = writeJson({
+      PI_CHAT_SERVER: "http://chat:8080",
+      PI_CHAT_AGENT: "alice",
+      PI_CHAT_COOLDOWN_MS: "2000",
+      PI_CHAT_ROOM_BACKEND__ROOM: "backend",
+      PI_CHAT_ROOM_INCIDENTS__ROOM: "incidents",
+      PI_CHAT_ROOM_INCIDENTS__COOLDOWN_MS: "200",
+    });
+    const merged = loadConfigFromFile(p, {});
+    const r = readChatEnvs(merged);
+    assert.equal(r.rooms.length, 2);
+
+    const backend = r.rooms.find((x) => x.alias === "BACKEND")!;
+    assert.equal(backend.env.server, "http://chat:8080", "server from flat file");
+    assert.equal(backend.env.agent, "alice", "agent from flat file");
+    assert.equal(backend.env.room, "backend");
+    assert.equal(backend.env.cooldownMs, 2000, "cooldownMs from flat file (no per-room override)");
+
+    const incidents = r.rooms.find((x) => x.alias === "INCIDENTS")!;
+    assert.equal(incidents.env.server, "http://chat:8080", "server from flat file");
+    assert.equal(incidents.env.agent, "alice", "agent from flat file");
+    assert.equal(incidents.env.room, "incidents");
+    assert.equal(incidents.env.cooldownMs, 200, "per-room file override beats flat file");
+  });
+
+  it("file flat PI_CHAT_AGENT is overridden by env PI_CHAT_AGENT (per-field, env > file)", () => {
+    // Operator puts the shared agent in the file but overrides per-container
+    // via a single env var. Env wins on key collision.
+    const p = writeJson({
+      PI_CHAT_SERVER: "http://chat:8080",
+      PI_CHAT_ROOM: "team",
+      PI_CHAT_AGENT: "alice-from-file",
+    });
+    const baseEnv: NodeJS.ProcessEnv = { PI_CHAT_AGENT: "alice-from-env" };
+    const merged = loadConfigFromFile(p, baseEnv);
+    const r = readChatEnvs(merged);
+    assert.equal(r.rooms.length, 1);
+    assert.equal(r.rooms[0].env.agent, "alice-from-env");
   });
 });

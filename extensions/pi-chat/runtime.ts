@@ -31,6 +31,7 @@ import {
   readChatEnvs,
   isMultiRoomDormant,
   describeEnv,
+  loadConfigFromFile,
   type AutoReplyMode,
   type ChatEnv,
   type ChatRoomConfig,
@@ -110,6 +111,19 @@ export interface ChatRoomHandle {
 export interface ChatRuntimeOptions {
   /** Override fetch — used by tests. */
   fetch?: typeof globalThis.fetch;
+  /**
+   * Override the env map the runtime reads from. Defaults to
+   * `process.env`. When set, `configFile` (if any) is layered *under*
+   * this map so env values beat file values on key collision.
+   */
+  env?: NodeJS.ProcessEnv;
+  /**
+   * Path to a JSON config file. Loaded via `loadConfigFromFile` and
+   * merged under `env`. CLI / env layer precedence:
+   *   `options.configFile` > `PI_CHAT_CONFIG_FILE` env var > no file.
+   * A missing / unreadable / malformed file fails fast at startup.
+   */
+  configFile?: string;
 }
 
 export interface ChatRuntimeHandle {
@@ -154,8 +168,18 @@ export function buildChatRuntime(
   ctx: ExtensionContext,
   options: ChatRuntimeOptions = {},
 ): ChatRuntimeHandle | null {
+  // Build the merged env map. Precedence (highest first):
+  //   options.env (test seam) > process.env > JSON config file.
+  // `loadConfigFromFile` merges the file under `baseEnv` so env values
+  // always beat file values on key collision. Missing / unreadable /
+  // malformed files throw — `index.ts` catches and surfaces as a
+  // startup-failed notify rather than a silent dormant.
+  const baseEnv = options.env ?? process.env;
+  const configFile = options.configFile ?? baseEnv.PI_CHAT_CONFIG_FILE;
+  const env = configFile ? loadConfigFromFile(configFile, baseEnv) : baseEnv;
+
   // Discover rooms. Empty result → dormant mode (no tools, one notify).
-  const discovered = readChatEnvs();
+  const discovered = readChatEnvs(env);
   for (const w of discovered.warnings) {
     ctx.ui.notify(`[chat] ${w}`, "warning");
   }

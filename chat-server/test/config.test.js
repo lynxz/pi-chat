@@ -3,10 +3,19 @@
 // isolation from the rest of the codebase. Per-module adoption is
 // exercised by the existing integration tests on each consume site.
 
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { loadConfig, CONFIG_DEFAULTS, CONFIG_ENV_KEYS } from "../lib/config.js";
+import {
+  loadConfig,
+  loadConfigFromFile,
+  CONFIG_DEFAULTS,
+  CONFIG_ENV_KEYS,
+} from "../lib/config.js";
+import { parseCliArgs } from "../server.js";
 
 /** An "empty" env: `loadConfig` falls back to defaults. */
 const EMPTY_ENV = Object.freeze({});
@@ -224,5 +233,267 @@ describe("loadConfig — roomTokens parsing", () => {
   it("returns null for the string 'null'", () => {
     const c = loadConfig({ CHAT_ROOM_TOKENS: "null" });
     assert.equal(c.roomTokens, null);
+  });
+});
+
+// --- loadConfigFromFile (JSON config file support) ------------------------
+//
+// `CHAT_CONFIG_FILE` (env var) or `--config <path>` (CLI flag) points the
+// server at a JSON file. The file layers *under* process.env so the
+// documented precedence is env > file > defaults. The file format mirrors
+// the env-var namespace verbatim — `CHAT_PORT`, `CHAT_TLS_CERT`,
+// `CHAT_ROOM_TOKENS`, etc.
+describe("loadConfigFromFile", () => {
+  let tmpDir;
+  let tmpFiles;
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "chat-cfg-"));
+    tmpFiles = [];
+  });
+  afterEach(() => {
+    for (const f of tmpFiles) {
+      try { rmSync(f); } catch { /* best-effort cleanup */ }
+    }
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* same */ }
+  });
+
+  /** Write a JSON file under the per-test tmp dir and return its path. */
+  function writeJson(obj) {
+    const p = join(tmpDir, `cfg-${tmpFiles.length}.json`);
+    writeFileSync(p, JSON.stringify(obj));
+    tmpFiles.push(p);
+    return p;
+  }
+
+  it("returns a flat env map from a valid JSON file", () => {
+    const p = writeJson({ CHAT_PORT: "9090", CHAT_HOST: "127.0.0.1" });
+    const merged = loadConfigFromFile(p);
+    assert.equal(merged.CHAT_PORT, "9090");
+    assert.equal(merged.CHAT_HOST, "127.0.0.1");
+  });
+
+  it("default baseEnv is process.env (file layered underneath)", () => {
+    const p = writeJson({ CHAT_PORT: "9090" });
+    const snapshot = process.env.CHAT_PORT;
+    process.env.CHAT_PORT = "7777";
+    try {
+      const merged = loadConfigFromFile(p);
+      assert.equal(merged.CHAT_PORT, "7777", "env beats file");
+    } finally {
+      if (snapshot === undefined) delete process.env.CHAT_PORT;
+      else process.env.CHAT_PORT = snapshot;
+    }
+  });
+
+  it("env beats file on key collision (explicit baseEnv)", () => {
+    const p = writeJson({ CHAT_PORT: "9090", CHAT_HOST: "10.0.0.1" });
+    const merged = loadConfigFromFile(p, { CHAT_PORT: "8888" });
+    assert.equal(merged.CHAT_PORT, "8888", "baseEnv wins on collision");
+    assert.equal(merged.CHAT_HOST, "10.0.0.1", "file still fills missing keys");
+  });
+
+  it("throws when the file does not exist (fail-fast at startup)", () => {
+    assert.throws(
+      () => loadConfigFromFile("/nonexistent/chat-server-config.json"),
+      /cannot read/,
+    );
+  });
+
+  it("throws when the file is not valid JSON", () => {
+    const p = join(tmpDir, "bad.json");
+    writeFileSync(p, "{not json}");
+    tmpFiles.push(p);
+    assert.throws(() => loadConfigFromFile(p), /invalid JSON/);
+  });
+
+  it("throws when the top-level value is not an object", () => {
+    const p = writeJson([1, 2, 3]);
+    assert.throws(() => loadConfigFromFile(p), /expected a JSON object/);
+    const p2 = writeJson("just a string");
+    assert.throws(() => loadConfigFromFile(p2), /expected a JSON object/);
+    const p3 = writeJson(42);
+    assert.throws(() => loadConfigFromFile(p3), /expected a JSON object/);
+    const p4 = writeJson(null);
+    assert.throws(() => loadConfigFromFile(p4), /expected a JSON object/);
+  });
+
+  it("coerces numbers and booleans to strings (env-var semantics)", () => {
+    const p = writeJson({
+      CHAT_PORT: 9090,
+      CHAT_TLS_ENABLED: true,
+      CHAT_TLS_DISABLED: false,
+    });
+    const merged = loadConfigFromFile(p);
+    assert.equal(merged.CHAT_PORT, "9090");
+    assert.equal(merged.CHAT_TLS_ENABLED, "true");
+    assert.equal(merged.CHAT_TLS_DISABLED, "false");
+  });
+
+  it("treats null values as the empty string (env unset == \"\")", () => {
+    const p = writeJson({ CHAT_HOST: null, CHAT_PORT: null });
+    const merged = loadConfigFromFile(p);
+    assert.equal(merged.CHAT_HOST, "");
+    assert.equal(merged.CHAT_PORT, "");
+  });
+
+  it("throws on array values (use a JSON-encoded string instead)", () => {
+    const p = writeJson({ CHAT_PORT: [1, 2, 3] });
+    assert.throws(() => loadConfigFromFile(p), /not supported|JSON-encoded string/);
+  });
+
+  it("throws on object values (use a JSON-encoded string instead)", () => {
+    const p = writeJson({ CHAT_ROOM_TOKENS: { lobby: "secret" } });
+    assert.throws(() => loadConfigFromFile(p), /not supported|JSON-encoded string/);
+  });
+
+  it("CHAT_ROOM_TOKENS as a JSON-encoded string parses through loadConfig", () => {
+    // The contract: file values mirror env semantics, so a nested JSON
+    // object becomes a string in the merged env and `parseRoomTokens`
+    // re-parses it via the same code path used for env vars.
+    const tokens = { lobby: "secret", ops: "x" };
+    const p = writeJson({ CHAT_ROOM_TOKENS: JSON.stringify(tokens) });
+    const merged = loadConfigFromFile(p);
+    const c = loadConfig(merged);
+    assert.equal(c.roomTokens.lobby, "secret");
+    assert.equal(c.roomTokens.ops, "x");
+  });
+
+  it("file values flow through to the final Config object", () => {
+    const p = writeJson({
+      CHAT_PORT: "9090",
+      CHAT_HISTORY_LIMIT: "1000",
+      CHAT_HOST: "127.0.0.1",
+    });
+    const c = loadConfig(loadConfigFromFile(p));
+    assert.equal(c.port, 9090);
+    assert.equal(c.historyLimit, 1000);
+    assert.equal(c.host, "127.0.0.1");
+  });
+
+  it("empty object file is equivalent to no file (defaults win)", () => {
+    const p = writeJson({});
+    const c = loadConfig(loadConfigFromFile(p));
+    assert.equal(c.port, CONFIG_DEFAULTS.port);
+    assert.equal(c.host, CONFIG_DEFAULTS.host);
+  });
+});
+
+// --- parseCliArgs (CLI flag surface) --------------------------------------
+//
+// `server.js`'s entry block parses `--config <path>` (alias `-c`) so
+// operators can point at a JSON file without an env var. CLI wins over
+// the env var because an explicit flag beats an ambient one.
+describe("parseCliArgs", () => {
+  it("returns an empty object for no flags", () => {
+    assert.deepEqual(parseCliArgs([]), {});
+  });
+
+  it("parses --config <path>", () => {
+    assert.deepEqual(parseCliArgs(["--config", "/etc/chat.json"]), {
+      configFile: "/etc/chat.json",
+    });
+  });
+
+  it("parses -c <path>", () => {
+    assert.deepEqual(parseCliArgs(["-c", "/etc/chat.json"]), {
+      configFile: "/etc/chat.json",
+    });
+  });
+
+  it("parses --config=<path>", () => {
+    assert.deepEqual(parseCliArgs(["--config=/etc/chat.json"]), {
+      configFile: "/etc/chat.json",
+    });
+  });
+
+  it("ignores unknown flags (forward-compat with new flags)", () => {
+    assert.deepEqual(parseCliArgs(["--future-flag", "x", "--config", "/etc/chat.json"]), {
+      configFile: "/etc/chat.json",
+    });
+  });
+
+  it("throws when --config has no path argument", () => {
+    assert.throws(() => parseCliArgs(["--config"]), /requires a path/);
+  });
+
+  it("throws when --config is followed by another flag", () => {
+    // The path argument can't itself start with `--`; that's almost
+    // certainly an operator mistake (e.g. swapped arg order) and we
+    // want to fail loudly instead of silently dropping the path.
+    assert.throws(() => parseCliArgs(["--config", "--other-flag"]), /requires a path/);
+  });
+});
+
+// --- createChatServer + config-file end-to-end ---------------------------
+//
+// `createChatServer({ configFile })` is the runtime seam: it loads the
+// file via `loadConfigFromFile` and passes the merged env into
+// `loadConfig`. The factory is also the path that accepts an explicit
+// `opts.configFile` (used by the CLI entry block after `parseCliArgs`).
+describe("createChatServer — config-file seam", () => {
+  let tmpDir;
+  let tmpFiles;
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "chat-cfg-e2e-"));
+    tmpFiles = [];
+  });
+  afterEach(() => {
+    for (const f of tmpFiles) {
+      try { rmSync(f); } catch { /* best-effort */ }
+    }
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* same */ }
+  });
+  function writeJson(obj) {
+    const p = join(tmpDir, `cfg-${tmpFiles.length}.json`);
+    writeFileSync(p, JSON.stringify(obj));
+    tmpFiles.push(p);
+    return p;
+  }
+
+  it("throws at construction time when the file is missing (fail-fast)", async () => {
+    const { createChatServer } = await import("../server.js");
+    assert.throws(
+      () => createChatServer({ configFile: "/nonexistent/chat.json", host: "127.0.0.1", port: 0 }),
+      /cannot read/,
+    );
+  });
+
+  it("applies file values when neither opts.env nor process.env disagrees", async () => {
+    const { createChatServer } = await import("../server.js");
+    const p = writeJson({ CHAT_HOST: "127.0.0.1", CHAT_PORT: "0" });
+    // Reset any ambient env that could interfere with the assertion.
+    const snapshot = { CHAT_HOST: process.env.CHAT_HOST, CHAT_PORT: process.env.CHAT_PORT };
+    delete process.env.CHAT_HOST;
+    delete process.env.CHAT_PORT;
+    let runtime;
+    try {
+      runtime = createChatServer({ configFile: p });
+      // start() flips the server into the listening state; shutdown()
+      // needs that to call server.close() cleanly. We tear down at the
+      // end to release the sweeper / ping handles.
+      await runtime.start();
+      assert.equal(runtime.ctx.config.host, "127.0.0.1");
+      assert.equal(runtime.ctx.config.port, 0);
+    } finally {
+      if (runtime) await runtime.shutdown("test");
+      if (snapshot.CHAT_HOST !== undefined) process.env.CHAT_HOST = snapshot.CHAT_HOST;
+      if (snapshot.CHAT_PORT !== undefined) process.env.CHAT_PORT = snapshot.CHAT_PORT;
+    }
+  });
+
+  it("opts.env beats file values on key collision", async () => {
+    const { createChatServer } = await import("../server.js");
+    const p = writeJson({ CHAT_HISTORY_LIMIT: "999" });
+    let runtime;
+    try {
+      runtime = createChatServer({
+        configFile: p,
+        env: { CHAT_HISTORY_LIMIT: "42" },
+      });
+      await runtime.start();
+      assert.equal(runtime.ctx.config.historyLimit, 42, "env beats file");
+    } finally {
+      if (runtime) await runtime.shutdown("test");
+    }
   });
 });

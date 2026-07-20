@@ -5,9 +5,14 @@
 // `PI_CHAT_*` vars are preserved as a synthesised `DEFAULT` room so existing
 // compose files keep working unchanged.
 //
-// Pure — no Pi, no fetch, no I/O beyond `process.env`. The wiring layer
-// (`index.ts`) decides what to do when any required var is missing
-// (dormant mode) and surfaces the `warnings[]` array via `ctx.ui.notify`.
+// Pure — no Pi, no fetch, no I/O. Both readers accept an `env` map (defaulting
+// to `process.env`) so callers can layer a config file *under* the real env
+// via `loadConfigFromFile(path, process.env)` and get the documented
+// precedence "env > file > default". The wiring layer (`index.ts` →
+// `runtime.ts`) decides when to load a file (via `PI_CHAT_CONFIG_FILE` or
+// `options.configFile`) and surfaces the `warnings[]` array via `ctx.ui.notify`.
+
+import { readFileSync } from "node:fs";
 
 export type AutoReplyMode = "mentions" | "questions" | "all";
 
@@ -19,9 +24,9 @@ function envIntValue(raw: string | undefined, def: number, min: number): number 
   return n;
 }
 
-/** Numeric helper: read the value of an env var, then parse. */
-function envInt(name: string, def: number, min: number): number {
-  return envIntValue(process.env[name], def, min);
+/** Numeric helper: read a value from an env map, then parse. */
+function envIntFromEnv(env: NodeJS.ProcessEnv, name: string, def: number, min: number): number {
+  return envIntValue(env[name], def, min);
 }
 
 /** Bool helper: treat "true"/"1"/"yes" as on, everything else as off (incl. unset). */
@@ -31,9 +36,9 @@ function envBoolValue(raw: string | undefined, def: boolean): boolean {
   return v === "true" || v === "1" || v === "yes";
 }
 
-/** Bool helper: read the value of an env var, then parse. */
-function envBool(name: string, def: boolean): boolean {
-  return envBoolValue(process.env[name], def);
+/** Bool helper: read a value from an env map, then parse. */
+function envBoolFromEnv(env: NodeJS.ProcessEnv, name: string, def: boolean): boolean {
+  return envBoolValue(env[name], def);
 }
 
 /** Auto-reply boolean: `false`/`0`/`no` disable, anything else (incl. unset) enables. */
@@ -217,25 +222,106 @@ export function normaliseAlias(raw: string): string {
   return trimmed.slice(0, 32);
 }
 
+/**
+ * Coerce a JSON-decoded scalar to the string shape the env-based readers
+ * expect. Strings pass through; numbers / booleans stringify; `null` /
+ * `undefined` become the empty string (env unset == ""). Arrays / objects
+ * are rejected so operators write a JSON-encoded string (e.g. for nested
+ * configs) instead of having us silently double-encode.
+ */
+function coerceFileValue(filePath: string, key: string, value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  const kind = Array.isArray(value) ? "array" : typeof value;
+  throw new Error(
+    `PI_CHAT_CONFIG_FILE=${filePath}: key "${key}" is ${kind}, expected string (write a JSON-encoded string instead)`,
+  );
+}
+
+/**
+ * Load a JSON config file and merge its entries under `baseEnv`.
+ *
+ * The returned map layers the file *below* `baseEnv` so callers can hand
+ * it straight to `readChatEnv(merged)` / `readChatEnvs(merged)` and get
+ * the documented precedence "env > file > default" without further
+ * bookkeeping. File values are coerced to strings to match env-var
+ * semantics — see `coerceFileValue` for the rules.
+ *
+ * Failure modes (all throw, fail-fast at startup):
+ *   - file does not exist or is unreadable
+ *   - file contents are not valid JSON
+ *   - top-level value is not a JSON object
+ *   - any per-key value is an array or object
+ *
+ * Duplicated from `chat-server/lib/config.js` to keep both packages
+ * self-contained (the project ships zero runtime deps and does not
+ * share modules across the two subprojects).
+ *
+ * @param filePath Absolute or CWD-relative path to the JSON file.
+ * @param baseEnv The env to layer the file under; `baseEnv` wins on
+ *   key collision (env beats file).
+ */
+export function loadConfigFromFile(
+  filePath: string,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    throw new Error(
+      `PI_CHAT_CONFIG_FILE=${filePath}: cannot read: ${err.message}`,
+      { cause: e },
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    const err = e as Error;
+    throw new Error(
+      `PI_CHAT_CONFIG_FILE=${filePath}: invalid JSON: ${err.message}`,
+      { cause: e },
+    );
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(
+      `PI_CHAT_CONFIG_FILE=${filePath}: expected a JSON object of key=value strings`,
+    );
+  }
+  const fileEntries: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    fileEntries[k] = coerceFileValue(filePath, k, v);
+  }
+  return { ...fileEntries, ...baseEnv };
+}
+
 // --- per-room resolution --------------------------------------------------
 
 type PerRoomOverrides = Partial<Record<RoomField, string>>;
 
 /**
- * Resolve one room's env from its per-alias overrides and the raw flat
- * env vars (used as per-field fallback). Returns `null` for `env` if any
- * required field is missing. Warnings are non-fatal (per-field parsing
+ * Resolve one room's env from its per-alias overrides and the flat env
+ * vars in `env` (used as per-field fallback). Returns `null` for `env` if
+ * any required field is missing. Warnings are non-fatal (per-field parsing
  * issues, etc.) — currently unused but reserved for future cases (e.g.
  * unknown mode string, etc.).
+ *
+ * `env` is an env-shaped map (any `Record<string, string|undefined>`),
+ * typically `process.env` but optionally a file-merged variant — see
+ * `loadConfigFromFile`.
  */
 function resolveOneRoom(
   alias: string,
   perRoom: PerRoomOverrides,
+  env: NodeJS.ProcessEnv,
 ): { env: ChatEnv | null; warnings: string[] } {
   const warnings: string[] = [];
 
   const get = (field: RoomField): string | undefined =>
-    perRoom[field] ?? process.env[flatName(field)];
+    perRoom[field] ?? env[flatName(field)];
 
   const server = (get("SERVER") ?? "").trim();
   const room = (get("ROOM") ?? "").trim();
@@ -254,7 +340,7 @@ function resolveOneRoom(
 
   const token = (get("TOKEN") ?? "").trim() || undefined;
 
-  const env: ChatEnv = {
+  const envOut: ChatEnv = {
     server,
     room,
     agent,
@@ -270,7 +356,7 @@ function resolveOneRoom(
     threadContext: envBoolValue(get("THREAD_CONTEXT"), true),
     prefix: (get("PREFIX") ?? "[chat {agent}]").replace(/\{agent\}/g, agent),
   };
-  return { env, warnings };
+  return { env: envOut, warnings };
 }
 
 function flatName(field: RoomField): string {
@@ -286,24 +372,29 @@ function flatName(field: RoomField): string {
  * Read the env into a single typed `ChatEnv`. Empty strings in required
  * vars stay `""`. Kept for back-compat with the single-room API and the
  * existing env test suite; the multi-room path uses `readChatEnvs()`.
+ *
+ * `env` defaults to `process.env`. Callers that have layered a config
+ * file *under* the real env via `loadConfigFromFile(path, process.env)`
+ * pass the merged map here so file values are visible without being
+ * shadowed by anything else in `process.env`.
  */
-export function readChatEnv(): ChatEnv {
+export function readChatEnv(env: NodeJS.ProcessEnv = process.env): ChatEnv {
   return {
-    server: (process.env.PI_CHAT_SERVER ?? "").trim(),
-    room: (process.env.PI_CHAT_ROOM ?? "").trim(),
-    agent: (process.env.PI_CHAT_AGENT ?? "").trim(),
-    token: (process.env.PI_CHAT_TOKEN ?? "").trim() || undefined,
-    autoreply: parseAutoreply(process.env.PI_CHAT_AUTOREPLY),
-    autoreplyMode: parseMode(process.env.PI_CHAT_AUTOREPLY_MODE),
-    history: envInt("PI_CHAT_HISTORY", 20, 1),
-    reconnectMs: envInt("PI_CHAT_RECONNECT_MS", 2000, 100),
-    cooldownMs: envInt("PI_CHAT_COOLDOWN_MS", 2000, 0),
-    minGapMs: envInt("PI_CHAT_MIN_GAP_MS", 1000, 0),
-    replyChainMs: envInt("PI_CHAT_REPLY_CHAIN_MS", 60_000, 0),
-    recentBufferSize: envInt("PI_CHAT_RECENT_BUFFER", 20, 1),
-    threadContext: envBool("PI_CHAT_THREAD_CONTEXT", true),
-    prefix: (process.env.PI_CHAT_PREFIX ?? "[chat {agent}]")
-      .replace(/\{agent\}/g, process.env.PI_CHAT_AGENT ?? ""),
+    server: (env.PI_CHAT_SERVER ?? "").trim(),
+    room: (env.PI_CHAT_ROOM ?? "").trim(),
+    agent: (env.PI_CHAT_AGENT ?? "").trim(),
+    token: (env.PI_CHAT_TOKEN ?? "").trim() || undefined,
+    autoreply: parseAutoreply(env.PI_CHAT_AUTOREPLY),
+    autoreplyMode: parseMode(env.PI_CHAT_AUTOREPLY_MODE),
+    history: envIntFromEnv(env, "PI_CHAT_HISTORY", 20, 1),
+    reconnectMs: envIntFromEnv(env, "PI_CHAT_RECONNECT_MS", 2000, 100),
+    cooldownMs: envIntFromEnv(env, "PI_CHAT_COOLDOWN_MS", 2000, 0),
+    minGapMs: envIntFromEnv(env, "PI_CHAT_MIN_GAP_MS", 1000, 0),
+    replyChainMs: envIntFromEnv(env, "PI_CHAT_REPLY_CHAIN_MS", 60_000, 0),
+    recentBufferSize: envIntFromEnv(env, "PI_CHAT_RECENT_BUFFER", 20, 1),
+    threadContext: envBoolFromEnv(env, "PI_CHAT_THREAD_CONTEXT", true),
+    prefix: (env.PI_CHAT_PREFIX ?? "[chat {agent}]")
+      .replace(/\{agent\}/g, env.PI_CHAT_AGENT ?? ""),
   };
 }
 
@@ -312,7 +403,7 @@ export function readChatEnv(): ChatEnv {
  * vars, plus the synthesised `DEFAULT` room from flat `PI_CHAT_*` vars.
  *
  * Discovery rules:
- *   1. Walk `process.env` and group every key matching
+ *   1. Walk `env` and group every key matching
  *      `PI_CHAT_ROOM_<ALIAS>__<FIELD>` (double-underscore separator) by
  *      its normalised alias.
  *   2. For each group, normalise the alias. Sanitised-to-empty aliases
@@ -324,20 +415,26 @@ export function readChatEnv(): ChatEnv {
  *      follow the same per-alias-then-flat layering.
  *   4. If no prefixed rooms resolved AND the flat `PI_CHAT_SERVER/ROOM/
  *      AGENT` are all set → synthesise a `DEFAULT` room from
- *      `readChatEnv()`.
+ *      `readChatEnv(env)`.
  *   5. If both prefixed and flat are set → prefixed wins. A warning
  *      is emitted so operators know the flat vars are being used only
  *      as per-field fallback (not as their own room).
  *
  * The returned list is sorted by alias (lexicographic) so the runtime
  * can pick a deterministic primary room.
+ *
+ * `env` defaults to `process.env`. Callers that have layered a config
+ * file *under* the real env via `loadConfigFromFile(path, process.env)`
+ * pass the merged map here so file values participate in the same
+ * per-alias / flat layering as env vars. File values never beat env
+ * values because the merge orders file below `baseEnv`.
  */
-export function readChatEnvs(): ReadChatEnvsResult {
+export function readChatEnvs(env: NodeJS.ProcessEnv = process.env): ReadChatEnvsResult {
   const warnings: string[] = [];
 
   // 1. Discover per-alias buckets.
   const rawBuckets = new Map<string, PerRoomOverrides>();
-  for (const [key, value] of Object.entries(process.env)) {
+  for (const [key, value] of Object.entries(env)) {
     if (value === undefined) continue;
     const parsed = parseRoomKey(key);
     if (!parsed) continue;
@@ -382,9 +479,9 @@ export function readChatEnvs(): ReadChatEnvsResult {
 
   // 3. Detect "both flat and prefixed" for the warning.
   const hasFlat =
-    !!((process.env.PI_CHAT_SERVER ?? "").trim()) &&
-    !!((process.env.PI_CHAT_ROOM ?? "").trim()) &&
-    !!((process.env.PI_CHAT_AGENT ?? "").trim());
+    !!((env.PI_CHAT_SERVER ?? "").trim()) &&
+    !!((env.PI_CHAT_ROOM ?? "").trim()) &&
+    !!((env.PI_CHAT_AGENT ?? "").trim());
   if (groups.size > 0 && hasFlat) {
     warnings.push(
       "PI_CHAT_ROOM_* and flat PI_CHAT_* are both set; prefixed rooms take precedence and flat vars are used only as per-field fallback (no DEFAULT room is synthesised)",
@@ -395,14 +492,14 @@ export function readChatEnvs(): ReadChatEnvsResult {
   const rooms: ChatRoomConfig[] = [];
   for (const alias of [...groups.keys()].sort()) {
     const bucket = groups.get(alias)!;
-    const { env, warnings: roomWarnings } = resolveOneRoom(alias, bucket);
+    const { env: roomEnv, warnings: roomWarnings } = resolveOneRoom(alias, bucket, env);
     warnings.push(...roomWarnings);
-    if (env) rooms.push({ alias, env });
+    if (roomEnv) rooms.push({ alias, env: roomEnv });
   }
 
   // 5. Synthesise DEFAULT from flat env if no prefixed rooms resolved.
   if (rooms.length === 0 && hasFlat) {
-    rooms.push({ alias: "DEFAULT", env: readChatEnv() });
+    rooms.push({ alias: "DEFAULT", env: readChatEnv(env) });
   }
 
   return { rooms, warnings };

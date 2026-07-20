@@ -12,7 +12,18 @@
 // The returned object is `Object.freeze`-d — consumers must build a new
 // config (or override at the call site, as `createChatServer` does) to
 // change values.
+//
+// `loadConfigFromFile(path, baseEnv)` layers a JSON config file under
+// `baseEnv` so callers can pass the result to `loadConfig` and get the
+// documented precedence: env vars > file > defaults. The file's keys
+// must use the same names as the env vars in CONFIG_ENV_KEYS.
+//
+// Both `CHAT_CONFIG_FILE` (env var) and `--config <path>` (CLI flag on
+// `server.js`) point the entry layer at a file. Missing / unreadable /
+// malformed files fail fast — the operator should see the error at
+// startup, not at the first request that depends on a missing key.
 
+import { readFileSync } from "node:fs";
 import { LIMITS } from "./validation.js";
 
 /** Numeric defaults shared between env-binding and fallbacks.
@@ -88,6 +99,82 @@ function parseString(raw, fallback) {
   return String(raw);
 }
 
+/**
+ * Coerce a JSON-decoded scalar to the string shape `loadConfig` expects.
+ *
+ * Strings pass through. Numbers / booleans are stringified so a file like
+ * `{"CHAT_PORT": 8080}` works the same as `CHAT_PORT=8080` in the env.
+ * `null` / `undefined` become the empty string — the same convention as
+ * env vars (`unset == ""`). Arrays / objects are rejected: a config file
+ * is meant to mirror env-var semantics, and `CHAT_ROOM_TOKENS` in
+ * particular must be a JSON-encoded string so `parseRoomTokens` can
+ * re-parse it via the same code path used for env vars.
+ */
+function coerceFileValue(value) {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  // Arrays / objects / other shapes: refuse rather than silently stringify.
+  // Telling the operator "write a JSON-encoded string" is kinder than
+  // stringifying an object and then failing the JSON.parse downstream.
+  const kind = Array.isArray(value) ? "array" : typeof value;
+  throw new Error(`CHAT_CONFIG_FILE: value of type ${kind} is not supported (write a JSON-encoded string instead)`);
+}
+
+/**
+ * Load a JSON config file and merge its entries under `baseEnv`.
+ *
+ * The returned object layers the file at the bottom of the precedence
+ * chain (`baseEnv` wins on key collision), so callers can hand it
+ * straight to `loadConfig(merged)` and get the documented rule
+ * "env > file > default" with no extra bookkeeping.
+ *
+ * Behaviour:
+ *   - File missing or unreadable → throws (fail fast at startup).
+ *   - File present but not valid JSON → throws.
+ *   - Top-level JSON value is not an object → throws.
+ *   - Per-key value is an array or object → throws (use a string).
+ *   - Per-key value is `null` / `undefined` → empty string (treat as unset).
+ *   - Per-key value is a number / boolean → coerced via `String(value)`.
+ *
+ * @param {string} filePath Absolute or CWD-relative path to the JSON file.
+ * @param {Record<string, string|undefined>} [baseEnv=process.env] The env
+ *   to layer the file under. `baseEnv` wins on key collision (env beats file).
+ * @returns {Record<string, string|undefined>}
+ */
+export function loadConfigFromFile(filePath, baseEnv = process.env) {
+  let raw;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch (e) {
+    throw new Error(
+      `CHAT_CONFIG_FILE=${filePath}: cannot read: ${e.message}`,
+      { cause: e },
+    );
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(
+      `CHAT_CONFIG_FILE=${filePath}: invalid JSON: ${e.message}`,
+      { cause: e },
+    );
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(
+      `CHAT_CONFIG_FILE=${filePath}: expected a JSON object of key=value strings`,
+    );
+  }
+  const fileEntries = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    fileEntries[k] = coerceFileValue(v);
+  }
+  // `baseEnv` wins on key collision. `{ ...fileEntries, ...baseEnv }`
+  // is the standard "lower-priority first" merge pattern.
+  return { ...fileEntries, ...baseEnv };
+}
+
 /** Parse CHAT_ROOM_TOKENS from its raw env string into a frozen plain object.
  *
  * Only plain (non-array) objects survive — arrays, primitives, and invalid
@@ -118,6 +205,11 @@ function parseRoomTokens(raw) {
  * from them: `maxTextBytes + maxMetaBytes + bodySlack` (default 6144).
  * Set `CHAT_MAX_BODY_BYTES` to override the derived body cap independently
  * (useful when you widen the field limits without recalculating).
+ *
+ * To layer a JSON config file *under* the env vars, run the file through
+ * `loadConfigFromFile(path, process.env)` and pass the result as `env`.
+ * Missing / unreadable / malformed files fail fast at the call site — see
+ * `loadConfigFromFile` for the exact contract.
  *
  * @param {Record<string, string|undefined>} [env=process.env]
  * @returns {Readonly<Config>}
