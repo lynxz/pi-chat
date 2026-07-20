@@ -1,6 +1,6 @@
 // Wiring test: confirms that when chat_send is invoked via the
 // runtime deps (as `pi.registerTool(...)` would do, just exercising the
-// `execute` callback directly), it triggers `pi.sendMessage` for the local
+// `execute` callback directly), it triggers `ctx.ui.notify` for the local
 // echo AND POSTs to the chat-server. This is the integration glue between
 // `tools.ts`, the runtime handle in `index.ts`, and the ChatClient.
 
@@ -60,6 +60,7 @@ function buildFakeRuntime(env: Partial<ChatEnv> & { prefix?: string } = {}) {
   const agentCount = { value: 0 };
 
   const sentMessages: SentMessage[] = [];
+  const notifications: Array<{ text: string; level?: NotifyLevel }> = [];
   const tools: Record<string, (id: string, params: any) => Promise<{ content: Array<{ type: string; text: string }>; details: unknown }>> = {};
 
   const fakePi = {
@@ -81,12 +82,7 @@ function buildFakeRuntime(env: Partial<ChatEnv> & { prefix?: string } = {}) {
   });
 
   const echoLocal = (text: string) => {
-    fakePi.sendMessage({
-      customType: "chat-out",
-      content: `${fullEnv.prefix}${text}`,
-      display: true,
-      details: { room: fullEnv.room, agent: fullEnv.agent },
-    });
+    notifications.push({ text: `${fullEnv.prefix}${text}`, level: "info" });
   };
 
   const sendOutbound = async (_room: unknown, text: string, meta?: Record<string, unknown>): Promise<SendResult> => {
@@ -137,14 +133,16 @@ function buildFakeRuntime(env: Partial<ChatEnv> & { prefix?: string } = {}) {
     formatHistory: (items: unknown) => defaultFormatHistory(
       Array.isArray(items) ? (items as Parameters<typeof defaultFormatHistory>[0]) : [],
     ),
-    notify: (_text: string, _level?: NotifyLevel) => undefined,
+    notify: (text: string, level?: NotifyLevel) => {
+      notifications.push({ text, level });
+    },
     getFocusedAlias: () => "DEFAULT",
     setFocusedAlias: () => undefined,
   };
 
   registerChatTools(fakePi as unknown as Parameters<typeof registerChatTools>[0], deps);
 
-  return { fakePi, sentMessages, tools, client, replies, fullEnv, deps };
+  return { fakePi, sentMessages, notifications, tools, client, replies, fullEnv, deps };
 }
 
 beforeEach(() => {
@@ -152,8 +150,8 @@ beforeEach(() => {
 });
 
 describe("chat_send — full wiring (POST + local echo)", () => {
-  it("POSTs to chat-server AND echoes locally via pi.sendMessage", async () => {
-    const { fakePi, sentMessages, tools, client, replies, fullEnv } = buildFakeRuntime();
+  it("POSTs to chat-server AND echoes locally via ctx.ui.notify", async () => {
+    const { fakePi, sentMessages, notifications, tools, client, replies, fullEnv } = buildFakeRuntime();
     // Pretend we're connected — the public server still validates that POST /messages comes from an
     // agent with an active SSE. We open an SSE so the POST succeeds.
     await client.start();
@@ -168,13 +166,14 @@ describe("chat_send — full wiring (POST + local echo)", () => {
     assert.deepEqual(details.mentions, ["@bob"]);
     assert.match(result.content[0].text, new RegExp(`Sent message ${details.id.slice(0, 8)}`));
 
-    // Local echo via pi.sendMessage
-    assert.equal(sentMessages.length, 1);
-    const msg = sentMessages[0];
-    assert.equal(msg.customType, "chat-out");
-    assert.equal(msg.display, true);
-    assert.equal(msg.content, `${fullEnv.prefix}hello @bob`);
-    assert.deepEqual(msg.details, { room: fullEnv.room, agent: fullEnv.agent });
+    // Local echo via ctx.ui.notify (NOT pi.sendMessage — that would feed back into the agent loop).
+    assert.equal(notifications.length, 1);
+    const note = notifications[0];
+    assert.equal(note.level, "info");
+    assert.equal(note.text, `${fullEnv.prefix}hello @bob`);
+
+    // No pi.sendMessage call — the echo must not pollute the agent's input stream.
+    assert.equal(sentMessages.length, 0, "no pi.sendMessage echo — echo is notify-only");
 
     // Reply tracker remembered the sent id (so future inbound `meta.replyTo` can hit).
     assert.equal(replies.has(details.id), true);
@@ -193,6 +192,7 @@ describe("chat_send — full wiring (POST + local echo)", () => {
     // handle by hard-coding the flag.)
     const fakePi = { registerTool() {}, sendMessage() {}, on() {} };
     const sentMessages: SentMessage[] = [];
+    const notifications: Array<{ text: string; level?: NotifyLevel }> = [];
     const tools: Record<string, (id: string, params: any) => Promise<unknown>> = {};
     (fakePi as { registerTool: (d: unknown) => void }).registerTool = (def: any) => {
       tools[def.name] = def.execute;
@@ -247,7 +247,9 @@ describe("chat_send — full wiring (POST + local echo)", () => {
       formatHistory: () => "",
       setAutoreply: () => undefined,
       reconnect: async () => undefined,
-      notify: () => undefined,
+      notify: (text: string, level?: NotifyLevel) => {
+        notifications.push({ text, level });
+      },
       getFocusedAlias: () => "DEFAULT",
       setFocusedAlias: () => undefined,
     });
@@ -256,7 +258,8 @@ describe("chat_send — full wiring (POST + local echo)", () => {
       () => tools.chat_send("t1", { text: "hello" }),
       (e: Error & { code?: string }) => e.code === "name_dormant",
     );
-    assert.equal(sentMessages.length, 0, "no local echo on name-dormant");
+    assert.equal(sentMessages.length, 0, "no pi.sendMessage on name-dormant");
+    assert.equal(notifications.length, 0, "no local echo on name-dormant");
 
     void replies; // silence unused
     await alice.close();

@@ -344,15 +344,11 @@ export function buildChatRuntime(
           mentions: result.mentions,
           ...(meta !== undefined ? { meta } : {}),
         });
-        // Local echo.
-        pi.sendMessage(
-          {
-            customType: "chat-out",
-            content: `${target.env.prefix}${resolution.resolvedText}`,
-            display: true,
-            details: { room: target.env.room, agent: target.env.agent, alias: target.alias },
-          },
-          { triggerTurn: false },
+        // Local echo — display via notify so the user sees it but it does not
+        // feed back into the agent's conversation input stream.
+        ctx.ui.notify(
+          `${target.env.prefix}${resolution.resolvedText}`,
+          "info",
         );
         return result;
       });
